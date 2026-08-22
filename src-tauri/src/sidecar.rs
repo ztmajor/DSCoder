@@ -70,7 +70,12 @@ async fn spawn_child(state: &Arc<SharedState>) -> Result<Child, DshError> {
     }
     cmd.env("DSH_HOME", &state.dsh_home)
         .env("DSH_TELEMETRY_DISABLED", "1")
-        .env("NO_COLOR", "1");
+        .env("NO_COLOR", "1")
+        // 插件记账数据收进 DSCoder 数据目录（默认落在 ~/.dsh）
+        .env(
+            "DSH_BOTTOM_INFO_BAR_DATA_DIR",
+            state.dsh_home.join("bottom-info-bar"),
+        );
     cmd.spawn()
         .map_err(|e| DshError::Invalid {
             message: format!(
