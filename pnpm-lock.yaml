@@ -7,6 +7,10 @@ settings:
 importers:
 
   .:
+    dependencies:
+      highlight.js:
+        specifier: ^11.12.0
+        version: 11.12.0
     devDependencies:
       '@tauri-apps/cli':
         specifier: ^2
@@ -90,6 +94,10 @@ packages:
     engines: {node: '>= 10'}
     hasBin: true
 
+  highlight.js@11.12.0:
+    resolution: {integrity: sha512-nbfWpyRMcMrPMmDwJB+dhX/eiaPKtc2RB+0QZskqJ3WjRA/FDS0e9hZrx8EC/lbEv8gXy98FcDbNa/dspAaJMg==}
+    engines: {node: '>=12.0.0'}
+
 snapshots:
 
   '@tauri-apps/cli-darwin-arm64@2.11.4':
@@ -138,3 +146,5 @@ snapshots:
       '@tauri-apps/cli-win32-arm64-msvc': 2.11.4
       '@tauri-apps/cli-win32-ia32-msvc': 2.11.4
       '@tauri-apps/cli-win32-x64-msvc': 2.11.4
+
+  highlight.js@11.12.0: {}
