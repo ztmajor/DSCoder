@@ -9,8 +9,8 @@ use crate::state::{DshStatus, SharedState};
 
 /// 目标运行时版本（fork 锁定）。
 const DSH_VERSION: &str = "0.1.1-rc.2";
-/// 默认内置插件清单（随应用打包、启动时幂等安装）。
-const DEFAULT_PLUGINS: &[&str] = &["dsh-bottom-info-bar", "dsh-tabs-terminal"];
+/// 底部信息栏插件的包名。
+const DEFAULT_PLUGINS: &[&str] = &["dsh-bottom-info-bar", "dsh-ui-tweaks", "dsh-tabs-terminal"];
 
 /// 运行时入口：`<data>/runtime/node_modules/@deepseek-ai/dsh/lib/bin.js`。
 fn runtime_bin() -> PathBuf {
@@ -141,7 +141,7 @@ async fn ensure_runtime(state: &Arc<SharedState>, app: &AppHandle) -> Result<(),
     Ok(())
 }
 
-/// profile 的 `dsh.profile.bundles` 是否已登记某插件。
+/// profile 的 `dsh.profile.bundles` 是否已登记插件。
 fn plugin_registered(name: &str) -> bool {
     let Ok(text) = std::fs::read_to_string(profile_package()) else {
         return false;
@@ -204,28 +204,126 @@ fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// 确保单个插件已安装进 web profile；缺失时复制内置产物并 `dsh plugin add`（幂等）。
-async fn ensure_one_plugin(app: &AppHandle, state: &Arc<SharedState>, name: &str) -> Result<(), String> {
-    eprintln!("[dscoder] ensure_plugin({name}): registered={}", plugin_registered(name));
+/// FNV-1a 64 位哈希步进：把一段字节折叠进当前哈希（确定性，跨进程稳定，无外部 crate）。
+fn fnv1a_mix(mut h: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// 递归收集目录下所有文件路径。
+fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            collect_files(&p, out);
+        } else if p.is_file() {
+            out.push(p);
+        }
+    }
+}
+
+/// 源目录内容摘要：文件相对路径 + 文件内容共同参与，路径排序保证跨次稳定。
+fn source_digest(dir: &Path) -> u64 {
+    let mut files = Vec::new();
+    collect_files(dir, &mut files);
+    files.sort();
+    let mut h = FNV_OFFSET;
+    for f in files {
+        let rel = f.strip_prefix(dir).unwrap_or(f.as_path());
+        h = fnv1a_mix(h, rel.to_string_lossy().as_bytes());
+        h = fnv1a_mix(h, &[0u8]);
+        if let Ok(data) = std::fs::read(&f) {
+            h = fnv1a_mix(h, &data);
+        }
+        h = fnv1a_mix(h, &[0u8]);
+    }
+    h
+}
+
+const DIGEST_MARKER: &str = ".dsh-source-digest";
+
+/// 读取安装目录里已记录的源摘要（无记录返回 None）。
+fn stored_digest(dir: &Path) -> Option<u64> {
+    std::fs::read_to_string(dir.join(DIGEST_MARKER))
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+}
+
+/// 把源摘要写回安装目录（失败静默：最坏情况是下次重拷一次，无副作用）。
+fn store_digest(dir: &Path, digest: u64) {
+    let _ = std::fs::write(dir.join(DIGEST_MARKER), digest.to_string());
+}
+
+/// 确保插件已安装进 web profile；缺失时复制内置产物并 `dsh plugin add`（幂等）。
+async fn ensure_plugin(app: &AppHandle, state: &Arc<SharedState>, name: &str) -> Result<(), String> {
+    eprintln!("[dscoder] ensure_plugin: enter name={}, registered={}", name, plugin_registered(name));
+    
+    let Some(src) = locate_plugin_dir(app, name) else {
+        // 无内置源：已登记则静默跳过，未登记则报错（与原来一致）。
+        if plugin_registered(name) {
+            return Ok(());
+        }
+        return Err(format!("找不到内置插件 {name}（资源缺失）"));
+    };
+    let dst = plugin_install_dir(name);
+    
     if plugin_registered(name) {
-        // 已登记：产物缺失或版本落后时，用内置源覆盖安装副本（link 指向该目录，覆盖即生效）。
-        let installed = plugin_install_dir(name);
-        let mut needs_heal = !installed.join("lib").join("index.js").exists();
+        // 1. 统一目标目录变量名 (假设外部的 dst 与 plugin_install_dir(name) 是同一个概念)
+        let installed = dst;
+        
+        // 2. 尝试获取源目录，如果找不到则默认使用 installed (避免后续 unwrap panic)
+        let src = locate_plugin_dir(app, name).unwrap_or_else(|| installed.clone());
+
+        // 3. 源即安装目录（无独立内置源）→ 无需同步
+        if src == installed {
+            return Ok(());
+        }
+
+        // 4. 检查是否需要修复 (needs_heal)
+        let mut needs_heal = false;
+
+        // 4.1 检查产物是否缺失 (合并了对 index.js 和 client.js 的检查)
+        if !installed.join("lib").join("index.js").exists() 
+            || !installed.join("lib").join("client.js").exists() 
+        {
+            needs_heal = true;
+        }
+
+        // 4.2 检查版本是否落后 (如果产物存在，进一步比对版本)
+        if !needs_heal && plugin_version(&installed) != plugin_version(&src) {
+            needs_heal = true;
+        }
+
+        // 4.3 检查内容摘要是否变化 (作为版本检查的补充或兜底，防止版本号未变但文件被篡改)
         if !needs_heal {
-            if let Some(src) = locate_plugin_dir(app, name) {
-                if plugin_version(&installed) != plugin_version(&src) {
-                    needs_heal = true;
-                }
+            let digest = source_digest(&src);
+            if stored_digest(&installed) != Some(digest) {
+                needs_heal = true;
             }
         }
+
+        // 5. 执行修复：用内置源覆盖安装副本（link 指向该目录，覆盖即生效）
         if needs_heal {
-            if let Some(src) = locate_plugin_dir(app, name) {
-                let _ = copy_dir(&src, &installed);
-            }
+            eprintln!("[dscoder] ensure_plugin: 产物缺失/版本落后/源内容变化，正在重拷至 {}", installed.display());
+            
+            copy_dir(&src, &installed).map_err(|e| format!("同步插件失败：{e}"))?;
+            
+            // 拷贝完成后，更新记录的摘要，确保下次校验的基准是最新的
+            store_digest(&installed, source_digest(&src));
         }
+
         return Ok(());
     }
 
+    // 首次：复制 + plugin add（建 link，仅此一次）。
     set_status(
         app,
         state,
@@ -240,12 +338,18 @@ async fn ensure_one_plugin(app: &AppHandle, state: &Arc<SharedState>, name: &str
     .await;
     eprintln!("[dscoder] ensure_plugin({name}): status=provisioning");
 
+    // 1. 确定源目录和目标目录 (缓存目标目录，避免多次函数调用)
     let src = locate_plugin_dir(app, name)
         .ok_or_else(|| format!("找不到内置插件 {name}（资源缺失）"))?;
+    let installed = plugin_install_dir(name);
     eprintln!("[dscoder] ensure_plugin({name}): src={}", src.display());
-    copy_dir(&src, &plugin_install_dir(name)).map_err(|e| format!("复制插件失败：{e}"))?;
-    eprintln!("[dscoder] ensure_plugin({name}): copied to {}", plugin_install_dir(name).display());
 
+    // 2. 复制文件并记录摘要 (补全了段2缺失的 store_digest，与上一段的 heal 逻辑形成闭环)
+    copy_dir(&src, &installed).map_err(|e| format!("复制插件失败：{e}"))?;
+    store_digest(&installed, source_digest(&src));
+    eprintln!("[dscoder] ensure_plugin({name}): copied to {}", installed.display());
+
+    // 3. 准备并执行 plugin add 命令
     let bin = runtime_bin();
     let home = dsh_home();
     let args = vec![
@@ -254,7 +358,7 @@ async fn ensure_one_plugin(app: &AppHandle, state: &Arc<SharedState>, name: &str
         "--profile".to_string(),
         "web".to_string(),
         "add".to_string(),
-        plugin_install_dir(name).display().to_string(),
+        installed.display().to_string(),
     ];
     eprintln!("[dscoder] ensure_plugin({name}): running plugin add: node {:?}", args);
     run_program(
@@ -266,6 +370,7 @@ async fn ensure_one_plugin(app: &AppHandle, state: &Arc<SharedState>, name: &str
     .await?;
     eprintln!("[dscoder] ensure_plugin({name}): plugin add done, registered={}", plugin_registered(name));
 
+    // 4. 校验安装结果
     if !plugin_registered(name) {
         return Err(format!("插件 {name} 安装后未在 web profile 生效"));
     }
@@ -289,7 +394,7 @@ pub async fn ensure_and_start(app: AppHandle, state: Arc<SharedState>) {
         return;
     }
     eprintln!("[dscoder] ensure_and_start: ensure_plugins...");
-    if let Err(e) = ensure_plugins(&app, &state).await {
+    if let Err(e) = ensure_plugin(&app, &state).await {
         eprintln!("[dscoder] ensure_and_start: ensure_plugins ERROR: {e}");
         fatal(&app, &state, e).await;
         return;
