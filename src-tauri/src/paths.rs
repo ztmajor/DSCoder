@@ -2,14 +2,45 @@ use std::path::{Path, PathBuf};
 
 use crate::state::Launch;
 
+/// Windows 短路径（8.3 短名），消除路径中的空格。
+/// dsh 0.1.1-rc.2 的 `plugin add` 会把含空格路径（如 `C:\Users\gentle zhou\...`）
+/// 在空格处拆断，写坏 profile 的 `link:` 依赖。用短路径（`C:\Users\GENTLE~1\...`）
+/// 规避。非 Windows 或获取失败时原样返回。
+#[cfg(windows)]
+fn short_path(p: &Path) -> PathBuf {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    let wide: Vec<u16> = p.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let mut buf = vec![0u16; wide.len() + 64];
+    unsafe {
+        let len = GetShortPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32);
+        if len > 0 && (len as usize) < buf.len() {
+            return PathBuf::from(OsString::from_wide(&buf[..len as usize]));
+        }
+    }
+    p.to_path_buf()
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetShortPathNameW(lpszLongPath: *const u16, lpszShortPath: *mut u16, cchBuffer: u32) -> u32;
+}
+
+#[cfg(not(windows))]
+fn short_path(p: &Path) -> PathBuf {
+    p.to_path_buf()
+}
+
 /// 应用数据根：Windows `%APPDATA%\DSCoder`，Linux `$XDG_DATA_HOME/DSCoder`
 /// （回落 `~/.local/share/DSCoder`）。与 Tauri 按标识符生成的目录解耦，
 /// 保证与设计文档/运行时安装位置一致。
+/// Windows 下返回短路径，规避 dsh 对含空格路径的处理缺陷。
 pub fn app_data_root() -> PathBuf {
     if cfg!(windows) {
         if let Ok(appdata) = std::env::var("APPDATA") {
             if !appdata.is_empty() {
-                return PathBuf::from(appdata).join("DSCoder");
+                return short_path(&PathBuf::from(appdata).join("DSCoder"));
             }
         }
     } else {
