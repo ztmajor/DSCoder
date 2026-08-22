@@ -263,46 +263,42 @@ fn store_digest(dir: &Path, digest: u64) {
 }
 
 /// 确保插件已安装进 web profile；缺失时复制内置产物并 `dsh plugin add`（幂等）。
-async fn ensure_plugin(app: &AppHandle, state: &Arc<SharedState>, name: &str) -> Result<(), String> {
-    eprintln!("[dscoder] ensure_plugin: enter name={}, registered={}", name, plugin_registered(name));
+async fn ensure_one_plugin(app: &AppHandle, state: &Arc<SharedState>, name: &str) -> Result<(), String> {
+    eprintln!("[dscoder] ensure_one_plugin: enter name={}, registered={}", name, plugin_registered(name));
     
+    // 1. 统一获取源目录。如果找不到，根据是否已登记决定是静默跳过还是报错。
     let Some(src) = locate_plugin_dir(app, name) else {
-        // 无内置源：已登记则静默跳过，未登记则报错（与原来一致）。
         if plugin_registered(name) {
-            return Ok(());
+            return Ok(()); // 无内置源但已登记，静默跳过
         }
         return Err(format!("找不到内置插件 {name}（资源缺失）"));
     };
-    let dst = plugin_install_dir(name);
     
+    // 2. 确定目标安装目录
+    let installed = plugin_install_dir(name);
+
+    // 3. 源即安装目录（无独立内置源）→ 无需同步
+    if src == installed {
+        return Ok(());
+    }
+
     if plugin_registered(name) {
-        // 1. 统一目标目录变量名 (假设外部的 dst 与 plugin_install_dir(name) 是同一个概念)
-        let installed = dst;
-        
-        // 2. 尝试获取源目录，如果找不到则默认使用 installed (避免后续 unwrap panic)
-        let src = locate_plugin_dir(app, name).unwrap_or_else(|| installed.clone());
-
-        // 3. 源即安装目录（无独立内置源）→ 无需同步
-        if src == installed {
-            return Ok(());
-        }
-
-        // 4. 检查是否需要修复 (needs_heal)
+        // --- 已注册：检查是否需要修复 (needs_heal) ---
         let mut needs_heal = false;
 
-        // 4.1 检查产物是否缺失 (合并了对 index.js 和 client.js 的检查)
+        // 3.1 检查产物是否缺失
         if !installed.join("lib").join("index.js").exists() 
             || !installed.join("lib").join("client.js").exists() 
         {
             needs_heal = true;
         }
 
-        // 4.2 检查版本是否落后 (如果产物存在，进一步比对版本)
+        // 3.2 检查版本是否落后
         if !needs_heal && plugin_version(&installed) != plugin_version(&src) {
             needs_heal = true;
         }
 
-        // 4.3 检查内容摘要是否变化 (作为版本检查的补充或兜底，防止版本号未变但文件被篡改)
+        // 3.3 检查内容摘要是否变化 (作为版本检查的补充或兜底)
         if !needs_heal {
             let digest = source_digest(&src);
             if stored_digest(&installed) != Some(digest) {
@@ -310,20 +306,17 @@ async fn ensure_plugin(app: &AppHandle, state: &Arc<SharedState>, name: &str) ->
             }
         }
 
-        // 5. 执行修复：用内置源覆盖安装副本（link 指向该目录，覆盖即生效）
+        // 3.4 执行修复
         if needs_heal {
-            eprintln!("[dscoder] ensure_plugin: 产物缺失/版本落后/源内容变化，正在重拷至 {}", installed.display());
-            
+            eprintln!("[dscoder] ensure_plugin({name}): 产物缺失/版本落后/源内容变化，正在重拷至 {}", installed.display());
             copy_dir(&src, &installed).map_err(|e| format!("同步插件失败：{e}"))?;
-            
-            // 拷贝完成后，更新记录的摘要，确保下次校验的基准是最新的
             store_digest(&installed, source_digest(&src));
         }
 
         return Ok(());
     }
 
-    // 首次：复制 + plugin add（建 link，仅此一次）。
+    // --- 4. 首次安装：复制 + plugin add ---
     set_status(
         app,
         state,
@@ -336,20 +329,14 @@ async fn ensure_plugin(app: &AppHandle, state: &Arc<SharedState>, name: &str) ->
         },
     )
     .await;
-    eprintln!("[dscoder] ensure_plugin({name}): status=provisioning");
+    eprintln!("[dscoder] ensure_plugin({name}): status=provisioning, src={}", src.display());
 
-    // 1. 确定源目录和目标目录 (缓存目标目录，避免多次函数调用)
-    let src = locate_plugin_dir(app, name)
-        .ok_or_else(|| format!("找不到内置插件 {name}（资源缺失）"))?;
-    let installed = plugin_install_dir(name);
-    eprintln!("[dscoder] ensure_plugin({name}): src={}", src.display());
-
-    // 2. 复制文件并记录摘要 (补全了段2缺失的 store_digest，与上一段的 heal 逻辑形成闭环)
+    // 复用外层已经获取的 src，无需再次调用 locate_plugin_dir
     copy_dir(&src, &installed).map_err(|e| format!("复制插件失败：{e}"))?;
     store_digest(&installed, source_digest(&src));
     eprintln!("[dscoder] ensure_plugin({name}): copied to {}", installed.display());
 
-    // 3. 准备并执行 plugin add 命令
+    // 准备并执行 plugin add 命令
     let bin = runtime_bin();
     let home = dsh_home();
     let args = vec![
@@ -370,7 +357,7 @@ async fn ensure_plugin(app: &AppHandle, state: &Arc<SharedState>, name: &str) ->
     .await?;
     eprintln!("[dscoder] ensure_plugin({name}): plugin add done, registered={}", plugin_registered(name));
 
-    // 4. 校验安装结果
+    // 5. 校验安装结果
     if !plugin_registered(name) {
         return Err(format!("插件 {name} 安装后未在 web profile 生效"));
     }
@@ -394,7 +381,7 @@ pub async fn ensure_and_start(app: AppHandle, state: Arc<SharedState>) {
         return;
     }
     eprintln!("[dscoder] ensure_and_start: ensure_plugins...");
-    if let Err(e) = ensure_plugin(&app, &state).await {
+    if let Err(e) = ensure_plugins(&app, &state).await {
         eprintln!("[dscoder] ensure_and_start: ensure_plugins ERROR: {e}");
         fatal(&app, &state, e).await;
         return;
