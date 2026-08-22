@@ -26,7 +26,7 @@ fn backoff(attempt: u32) -> Duration {
 }
 
 /// 写状态并广播 `dsh://status` 事件。
-async fn set_status(app: &AppHandle, state: &Arc<SharedState>, status: DshStatus) {
+pub(crate) async fn set_status(app: &AppHandle, state: &Arc<SharedState>, status: DshStatus) {
     *state.status.write().await = status.clone();
     let _ = app.emit("dsh://status", &status);
 }

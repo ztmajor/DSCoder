@@ -1,5 +1,6 @@
 mod error;
 mod paths;
+mod provision;
 mod proxy;
 mod sidecar;
 mod state;
@@ -43,7 +44,12 @@ fn init_state(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         tasks: tokio::sync::Mutex::new(Vec::new()),
     });
     app.manage(shared.clone());
-    sidecar::spawn_supervisor(app.handle().clone(), shared);
+    // 先供给（运行时 + 插件），完成后再拉起 sidecar 监督器。
+    let handle = app.handle().clone();
+    let st = shared.clone();
+    tauri::async_runtime::spawn(async move {
+        provision::ensure_and_start(handle, st).await;
+    });
     Ok(())
 }
 
