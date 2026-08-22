@@ -9,8 +9,8 @@ use crate::state::{DshStatus, SharedState};
 
 /// 目标运行时版本（fork 锁定）。
 const DSH_VERSION: &str = "0.1.1-rc.2";
-/// 底部信息栏插件的包名。
-const PLUGIN_NAME: &str = "dsh-bottom-info-bar";
+/// 内置桌面插件包名列表（按序供给）。
+const PLUGIN_NAMES: &[&str] = &["dsh-bottom-info-bar", "dsh-ui-tweaks"];
 
 /// 运行时入口：`<data>/runtime/node_modules/@deepseek-ai/dsh/lib/bin.js`。
 fn runtime_bin() -> PathBuf {
@@ -36,8 +36,8 @@ fn dsh_home() -> PathBuf {
     paths::app_data_root().join("dsh-home")
 }
 
-fn plugin_install_dir() -> PathBuf {
-    paths::app_data_root().join("plugins").join(PLUGIN_NAME)
+fn plugin_install_dir(name: &str) -> PathBuf {
+    paths::app_data_root().join("plugins").join(name)
 }
 
 fn profile_package() -> PathBuf {
@@ -142,7 +142,7 @@ async fn ensure_runtime(state: &Arc<SharedState>, app: &AppHandle) -> Result<(),
 }
 
 /// profile 的 `dsh.profile.bundles` 是否已登记插件。
-fn plugin_registered() -> bool {
+fn plugin_registered(name: &str) -> bool {
     let Ok(text) = std::fs::read_to_string(profile_package()) else {
         return false;
     };
@@ -153,29 +153,29 @@ fn plugin_registered() -> bool {
         .and_then(|d| d.get("profile"))
         .and_then(|p| p.get("bundles"))
         .and_then(|b| b.as_array())
-        .map(|arr| arr.iter().any(|v| v.as_str() == Some(PLUGIN_NAME)))
+        .map(|arr| arr.iter().any(|v| v.as_str() == Some(name)))
         .unwrap_or(false)
 }
 
 /// 定位内置插件目录：优先应用资源，其次 dev 源码资源，最后已安装副本。
-fn locate_plugin_dir(app: &AppHandle) -> Option<PathBuf> {
+fn locate_plugin_dir(app: &AppHandle, name: &str) -> Option<PathBuf> {
     let probe = |dir: &Path| -> bool {
         dir.join("package.json").exists() && dir.join("lib").join("index.js").exists()
     };
 
     if let Ok(res) = app.path().resource_dir() {
-        let p = res.join(PLUGIN_NAME);
+        let p = res.join(name);
         if probe(&p) {
             return Some(p);
         }
     }
     let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("resources")
-        .join(PLUGIN_NAME);
+        .join(name);
     if probe(&dev) {
         return Some(dev);
     }
-    let installed = plugin_install_dir();
+    let installed = plugin_install_dir(name);
     if probe(&installed) {
         return Some(installed);
     }
@@ -197,20 +197,97 @@ fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// FNV-1a 64 位哈希步进：把一段字节折叠进当前哈希（确定性，跨进程稳定，无外部 crate）。
+fn fnv1a_mix(mut h: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// 递归收集目录下所有文件路径。
+fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            collect_files(&p, out);
+        } else if p.is_file() {
+            out.push(p);
+        }
+    }
+}
+
+/// 源目录内容摘要：文件相对路径 + 文件内容共同参与，路径排序保证跨次稳定。
+fn source_digest(dir: &Path) -> u64 {
+    let mut files = Vec::new();
+    collect_files(dir, &mut files);
+    files.sort();
+    let mut h = FNV_OFFSET;
+    for f in files {
+        let rel = f.strip_prefix(dir).unwrap_or(f.as_path());
+        h = fnv1a_mix(h, rel.to_string_lossy().as_bytes());
+        h = fnv1a_mix(h, &[0u8]);
+        if let Ok(data) = std::fs::read(&f) {
+            h = fnv1a_mix(h, &data);
+        }
+        h = fnv1a_mix(h, &[0u8]);
+    }
+    h
+}
+
+const DIGEST_MARKER: &str = ".dsh-source-digest";
+
+/// 读取安装目录里已记录的源摘要（无记录返回 None）。
+fn stored_digest(dir: &Path) -> Option<u64> {
+    std::fs::read_to_string(dir.join(DIGEST_MARKER))
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+}
+
+/// 把源摘要写回安装目录（失败静默：最坏情况是下次重拷一次，无副作用）。
+fn store_digest(dir: &Path, digest: u64) {
+    let _ = std::fs::write(dir.join(DIGEST_MARKER), digest.to_string());
+}
+
 /// 确保插件已安装进 web profile；缺失时复制内置产物并 `dsh plugin add`（幂等）。
-async fn ensure_plugin(app: &AppHandle, state: &Arc<SharedState>) -> Result<(), String> {
-    eprintln!("[dscoder] ensure_plugin: enter, registered={}", plugin_registered());
-    if plugin_registered() {
-        // 已登记但产物被删时补拷（不自愈 link，仅恢复文件）。
-        if !plugin_install_dir().join("lib").join("index.js").exists() {
-            let Some(src) = locate_plugin_dir(app) else {
-                return Ok(()); // 登记在、无内置源 → 不做破坏性动作
-            };
-            let _ = copy_dir(&src, &plugin_install_dir());
+/// 已登记时按源目录内容摘要做增量同步：源变了（或产物被删）只重拷文件、不再 spawn pnpm，
+/// 故重启开销为毫秒级（哈希 + 条件重拷几个小文件），不拖慢启动。
+async fn ensure_plugin(app: &AppHandle, state: &Arc<SharedState>, name: &str) -> Result<(), String> {
+    eprintln!("[dscoder] ensure_plugin: enter name={} registered={}", name, plugin_registered(name));
+
+    let Some(src) = locate_plugin_dir(app, name) else {
+        // 无内置源：已登记则静默跳过，未登记则报错（与原来一致）。
+        if plugin_registered(name) {
+            return Ok(());
+        }
+        return Err(format!("找不到内置插件 {name}（资源缺失）"));
+    };
+    let dst = plugin_install_dir(name);
+
+    if plugin_registered(name) {
+        // 源即安装目录（无独立内置源）→ 无需同步。
+        if src == dst {
+            return Ok(());
+        }
+        // 源内容变化 OR 产物被删 → 仅重拷文件（link 仍在，无需重跑 plugin add）。
+        let missing = !dst.join("lib").join("index.js").exists()
+            || !dst.join("lib").join("client.js").exists();
+        let digest = source_digest(&src);
+        if stored_digest(&dst) != Some(digest) || missing {
+            eprintln!("[dscoder] ensure_plugin: 源变化/产物缺失，重拷 {}", dst.display());
+            copy_dir(&src, &dst).map_err(|e| format!("同步插件失败：{e}"))?;
+            store_digest(&dst, digest);
         }
         return Ok(());
     }
 
+    // 首次：复制 + plugin add（建 link，仅此一次）。
     set_status(
         app,
         state,
@@ -219,16 +296,16 @@ async fn ensure_plugin(app: &AppHandle, state: &Arc<SharedState>) -> Result<(), 
             port: None,
             pid: None,
             attempt: 0,
-            message: Some("正在安装底部信息栏插件…".into()),
+            message: Some(format!("正在安装插件 {name}…")),
         },
     )
     .await;
-    eprintln!("[dscoder] ensure_plugin: status=provisioning(插件)");
+    eprintln!("[dscoder] ensure_plugin: status=provisioning(插件 {name})");
 
-    let src = locate_plugin_dir(app).ok_or("找不到内置插件 dsh-bottom-info-bar（资源缺失）")?;
     eprintln!("[dscoder] ensure_plugin: src={}", src.display());
-    copy_dir(&src, &plugin_install_dir()).map_err(|e| format!("复制插件失败：{e}"))?;
-    eprintln!("[dscoder] ensure_plugin: copied to {}", plugin_install_dir().display());
+    copy_dir(&src, &dst).map_err(|e| format!("复制插件失败：{e}"))?;
+    store_digest(&dst, source_digest(&src));
+    eprintln!("[dscoder] ensure_plugin: copied to {}", dst.display());
 
     let bin = runtime_bin();
     let home = dsh_home();
@@ -238,7 +315,7 @@ async fn ensure_plugin(app: &AppHandle, state: &Arc<SharedState>) -> Result<(), 
         "--profile".to_string(),
         "web".to_string(),
         "add".to_string(),
-        plugin_install_dir().display().to_string(),
+        dst.display().to_string(),
     ];
     eprintln!("[dscoder] ensure_plugin: running plugin add: node {:?}", args);
     run_program(
@@ -248,10 +325,10 @@ async fn ensure_plugin(app: &AppHandle, state: &Arc<SharedState>) -> Result<(), 
         "插件安装",
     )
     .await?;
-    eprintln!("[dscoder] ensure_plugin: plugin add done, registered={}", plugin_registered());
+    eprintln!("[dscoder] ensure_plugin: plugin add done, registered={}", plugin_registered(name));
 
-    if !plugin_registered() {
-        return Err("插件安装后未在 web profile 生效".into());
+    if !plugin_registered(name) {
+        return Err(format!("插件 {name} 安装后未在 web profile 生效"));
     }
     Ok(())
 }
@@ -265,10 +342,12 @@ pub async fn ensure_and_start(app: AppHandle, state: Arc<SharedState>) {
         return;
     }
     eprintln!("[dscoder] ensure_and_start: ensure_plugin...");
-    if let Err(e) = ensure_plugin(&app, &state).await {
-        eprintln!("[dscoder] ensure_and_start: ensure_plugin ERROR: {e}");
-        fatal(&app, &state, e).await;
-        return;
+    for name in PLUGIN_NAMES {
+        if let Err(e) = ensure_plugin(&app, &state, name).await {
+            eprintln!("[dscoder] ensure_and_start: ensure_plugin({name}) ERROR: {e}");
+            fatal(&app, &state, e).await;
+            return;
+        }
     }
     eprintln!("[dscoder] ensure_and_start: spawning supervisor");
     sidecar::spawn_supervisor(app, state);

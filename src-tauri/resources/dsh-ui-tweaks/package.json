@@ -1,0 +1,35 @@
+{
+  "name": "dsh-ui-tweaks",
+  "version": "0.0.0",
+  "private": true,
+  "description": "对话界面调整：消息字体大小、代码字号、行高、Markdown 表格样式、对话框宽度，以及对话时间线导航轨。作为桌面内置功能挂在设置页面。",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "react": "^18.0.0"
+  }
+}
