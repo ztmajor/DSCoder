@@ -24,8 +24,7 @@
     "active": true,
     "targets": "all",
     "resources": [
-      "resources/dsh-bottom-info-bar/**/*",
-      "resources/dsh-tabs-terminal/**/*"
+      "resources/*/**/*"
     ],
     "icon": [
       "icons/32x32.png",

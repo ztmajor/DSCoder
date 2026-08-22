@@ -9,8 +9,12 @@ use crate::state::{DshStatus, SharedState};
 
 /// 目标运行时版本（fork 锁定）。
 const DSH_VERSION: &str = "0.1.1-rc.2";
-/// 底部信息栏插件的包名。
-const DEFAULT_PLUGINS: &[&str] = &["dsh-bottom-info-bar", "dsh-ui-tweaks", "dsh-tabs-terminal"];
+/// 一个被自动发现的内置插件：规范名（package.json 的 name）、目录名（仅用于排序）、已定位源目录。
+struct Plugin {
+    name: String,
+    dir: String,
+    src: PathBuf,
+}
 
 /// 运行时入口：`<data>/runtime/node_modules/@deepseek-ai/dsh/lib/bin.js`。
 fn runtime_bin() -> PathBuf {
@@ -157,29 +161,69 @@ fn plugin_registered(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// 定位内置插件目录：优先应用资源，其次 dev 源码资源，最后已安装副本。
-fn locate_plugin_dir(app: &AppHandle, name: &str) -> Option<PathBuf> {
-    let probe = |dir: &Path| -> bool {
+/// 读取插件目录 package.json 的 name 字段（缺失/损坏返回 None）。
+fn plugin_name(dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join("package.json")).ok()?;
+    let json = serde_json::from_str::<serde_json::Value>(&text).ok()?;
+    json.get("name").and_then(|v| v.as_str()).map(str::to_string)
+}
+
+/// 自动发现内置插件：扫描 resources/ 下含 package.json 与 lib/index.js 的子目录。
+///
+/// - 规范名取自 `package.json.name`（用于注册与安装目录）；目录名仅用于排序，
+///   因此可用 `01-`、`02-` 数字前缀控制供给顺序，而不会污染插件名。
+/// - 候选根按优先级扫描：dev 源码 `resources/` 优先（开发时改源码即时生效），
+///   打包进安装包的 `resource_dir` 兜底（发布到用户机器时源码路径不存在）。
+/// - 同名插件以先扫到的根为准；结果按目录名字典序排序，保证每次启动确定。
+fn discover_plugins(app: &AppHandle) -> Vec<Plugin> {
+    let is_plugin = |dir: &Path| -> bool {
         dir.join("package.json").exists() && dir.join("lib").join("index.js").exists()
     };
 
+    let mut roots: Vec<PathBuf> = Vec::new();
+    roots.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources"));
     if let Ok(res) = app.path().resource_dir() {
-        let p = res.join(name);
-        if probe(&p) {
-            return Some(p);
+        roots.push(res);
+    }
+
+    let mut seen: std::collections::BTreeMap<String, Plugin> = Default::default();
+    for root in roots {
+        let Ok(rd) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        let mut entries: Vec<_> = rd.flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let path = entry.path();
+            if !path.is_dir() || !is_plugin(&path) {
+                continue;
+            }
+            let Some(dir) = path.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
+                continue;
+            };
+            let name = match plugin_name(&path) {
+                Some(n) => n,
+                None => {
+                    eprintln!("[dscoder] discover_plugins: {dir} 缺少可解析的 package.json name，回退用目录名");
+                    dir.clone()
+                }
+            };
+            if seen.contains_key(&name) {
+                eprintln!("[dscoder] discover_plugins: 插件名 {name} 重复，忽略 {}", path.display());
+                continue;
+            }
+            seen.insert(name.clone(), Plugin { name, dir, src: path });
         }
     }
-    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("resources")
-        .join(name);
-    if probe(&dev) {
-        return Some(dev);
-    }
-    let installed = plugin_install_dir(name);
-    if probe(&installed) {
-        return Some(installed);
-    }
-    None
+
+    let mut plugins: Vec<Plugin> = seen.into_values().collect();
+    plugins.sort_by(|a, b| a.dir.cmp(&b.dir));
+    eprintln!(
+        "[dscoder] discover_plugins: 发现 {} 个插件：{:?}",
+        plugins.len(),
+        plugins.iter().map(|p| p.name.as_str()).collect::<Vec<_>>()
+    );
+    plugins
 }
 
 /// 读取插件目录 package.json 的 version 字段（缺失/损坏返回 None）。
@@ -263,24 +307,22 @@ fn store_digest(dir: &Path, digest: u64) {
 }
 
 /// 确保插件已安装进 web profile；缺失时复制内置产物并 `dsh plugin add`（幂等）。
-async fn ensure_one_plugin(app: &AppHandle, state: &Arc<SharedState>, name: &str) -> Result<(), String> {
-    eprintln!("[dscoder] ensure_one_plugin: enter name={}, registered={}", name, plugin_registered(name));
-    
-    // 1. 统一获取源目录。如果找不到，根据是否已登记决定是静默跳过还是报错。
-    let Some(src) = locate_plugin_dir(app, name) else {
-        if plugin_registered(name) {
-            return Ok(()); // 无内置源但已登记，静默跳过
-        }
-        return Err(format!("找不到内置插件 {name}（资源缺失）"));
-    };
-    
-    // 2. 确定目标安装目录
+/// `plugin.src` 已由 `discover_plugins` 定位，故这里不再做"找不到源"的兜底。
+async fn ensure_one_plugin(
+    app: &AppHandle,
+    state: &Arc<SharedState>,
+    plugin: &Plugin,
+) -> Result<(), String> {
+    let name = plugin.name.as_str();
+    let src = plugin.src.as_path();
     let installed = plugin_install_dir(name);
 
-    // 3. 源即安装目录（无独立内置源）→ 无需同步
-    if src == installed {
-        return Ok(());
-    }
+    eprintln!(
+        "[dscoder] ensure_one_plugin: enter name={}, src={}, registered={}",
+        name,
+        src.display(),
+        plugin_registered(name)
+    );
 
     if plugin_registered(name) {
         // --- 已注册：检查是否需要修复 (needs_heal) ---
@@ -294,13 +336,13 @@ async fn ensure_one_plugin(app: &AppHandle, state: &Arc<SharedState>, name: &str
         }
 
         // 3.2 检查版本是否落后
-        if !needs_heal && plugin_version(&installed) != plugin_version(&src) {
+        if !needs_heal && plugin_version(&installed) != plugin_version(src) {
             needs_heal = true;
         }
 
         // 3.3 检查内容摘要是否变化 (作为版本检查的补充或兜底)
         if !needs_heal {
-            let digest = source_digest(&src);
+            let digest = source_digest(src);
             if stored_digest(&installed) != Some(digest) {
                 needs_heal = true;
             }
@@ -309,8 +351,8 @@ async fn ensure_one_plugin(app: &AppHandle, state: &Arc<SharedState>, name: &str
         // 3.4 执行修复
         if needs_heal {
             eprintln!("[dscoder] ensure_plugin({name}): 产物缺失/版本落后/源内容变化，正在重拷至 {}", installed.display());
-            copy_dir(&src, &installed).map_err(|e| format!("同步插件失败：{e}"))?;
-            store_digest(&installed, source_digest(&src));
+            copy_dir(src, &installed).map_err(|e| format!("同步插件失败：{e}"))?;
+            store_digest(&installed, source_digest(src));
         }
 
         return Ok(());
@@ -331,9 +373,9 @@ async fn ensure_one_plugin(app: &AppHandle, state: &Arc<SharedState>, name: &str
     .await;
     eprintln!("[dscoder] ensure_plugin({name}): status=provisioning, src={}", src.display());
 
-    // 复用外层已经获取的 src，无需再次调用 locate_plugin_dir
-    copy_dir(&src, &installed).map_err(|e| format!("复制插件失败：{e}"))?;
-    store_digest(&installed, source_digest(&src));
+    // src 已由 discover_plugins 定位，直接复制即可
+    copy_dir(src, &installed).map_err(|e| format!("复制插件失败：{e}"))?;
+    store_digest(&installed, source_digest(src));
     eprintln!("[dscoder] ensure_plugin({name}): copied to {}", installed.display());
 
     // 准备并执行 plugin add 命令
@@ -364,10 +406,11 @@ async fn ensure_one_plugin(app: &AppHandle, state: &Arc<SharedState>, name: &str
     Ok(())
 }
 
-/// 确保全部默认插件已安装（逐个幂等）。
+/// 确保全部内置插件已安装（逐个幂等）；清单由目录自动发现，无需手工登记。
 async fn ensure_plugins(app: &AppHandle, state: &Arc<SharedState>) -> Result<(), String> {
-    for name in DEFAULT_PLUGINS {
-        ensure_one_plugin(app, state, name).await?;
+    let plugins = discover_plugins(app);
+    for plugin in &plugins {
+        ensure_one_plugin(app, state, plugin).await?;
     }
     Ok(())
 }
