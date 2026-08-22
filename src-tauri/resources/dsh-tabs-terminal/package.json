@@ -1,0 +1,48 @@
+{
+  "name": "dsh-tabs-terminal",
+  "version": "0.1.2",
+  "description": "DeepSeek Harness IDE 式插件：左侧文件树 + 顶部标签栏（聊天为非关闭标签、打开的文件为可关闭标签）+ 只读文件查看 + 底部 Ctrl+` 可切换的终端面板。",
+  "keywords": [
+    "deepseek",
+    "deepseek-harness",
+    "dsh",
+    "dsh-tabs-terminal",
+    "file-tree",
+    "tabs",
+    "terminal",
+    "plugin"
+  ],
+  "author": "DSCoder",
+  "license": "MIT",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "react": "^18.0.0"
+  }
+}

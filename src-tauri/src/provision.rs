@@ -9,8 +9,8 @@ use crate::state::{DshStatus, SharedState};
 
 /// 目标运行时版本（fork 锁定）。
 const DSH_VERSION: &str = "0.1.1-rc.2";
-/// 底部信息栏插件的包名。
-const PLUGIN_NAME: &str = "dsh-bottom-info-bar";
+/// 默认内置插件清单（随应用打包、启动时幂等安装）。
+const DEFAULT_PLUGINS: &[&str] = &["dsh-bottom-info-bar", "dsh-tabs-terminal"];
 
 /// 运行时入口：`<data>/runtime/node_modules/@deepseek-ai/dsh/lib/bin.js`。
 fn runtime_bin() -> PathBuf {
@@ -36,8 +36,8 @@ fn dsh_home() -> PathBuf {
     paths::app_data_root().join("dsh-home")
 }
 
-fn plugin_install_dir() -> PathBuf {
-    paths::app_data_root().join("plugins").join(PLUGIN_NAME)
+fn plugin_install_dir(name: &str) -> PathBuf {
+    paths::app_data_root().join("plugins").join(name)
 }
 
 fn profile_package() -> PathBuf {
@@ -141,8 +141,8 @@ async fn ensure_runtime(state: &Arc<SharedState>, app: &AppHandle) -> Result<(),
     Ok(())
 }
 
-/// profile 的 `dsh.profile.bundles` 是否已登记插件。
-fn plugin_registered() -> bool {
+/// profile 的 `dsh.profile.bundles` 是否已登记某插件。
+fn plugin_registered(name: &str) -> bool {
     let Ok(text) = std::fs::read_to_string(profile_package()) else {
         return false;
     };
@@ -153,33 +153,40 @@ fn plugin_registered() -> bool {
         .and_then(|d| d.get("profile"))
         .and_then(|p| p.get("bundles"))
         .and_then(|b| b.as_array())
-        .map(|arr| arr.iter().any(|v| v.as_str() == Some(PLUGIN_NAME)))
+        .map(|arr| arr.iter().any(|v| v.as_str() == Some(name)))
         .unwrap_or(false)
 }
 
 /// 定位内置插件目录：优先应用资源，其次 dev 源码资源，最后已安装副本。
-fn locate_plugin_dir(app: &AppHandle) -> Option<PathBuf> {
+fn locate_plugin_dir(app: &AppHandle, name: &str) -> Option<PathBuf> {
     let probe = |dir: &Path| -> bool {
         dir.join("package.json").exists() && dir.join("lib").join("index.js").exists()
     };
 
     if let Ok(res) = app.path().resource_dir() {
-        let p = res.join(PLUGIN_NAME);
+        let p = res.join(name);
         if probe(&p) {
             return Some(p);
         }
     }
     let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("resources")
-        .join(PLUGIN_NAME);
+        .join(name);
     if probe(&dev) {
         return Some(dev);
     }
-    let installed = plugin_install_dir();
+    let installed = plugin_install_dir(name);
     if probe(&installed) {
         return Some(installed);
     }
     None
+}
+
+/// 读取插件目录 package.json 的 version 字段（缺失/损坏返回 None）。
+fn plugin_version(dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join("package.json")).ok()?;
+    let json = serde_json::from_str::<serde_json::Value>(&text).ok()?;
+    json.get("version").and_then(|v| v.as_str()).map(str::to_string)
 }
 
 fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
@@ -197,16 +204,24 @@ fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// 确保插件已安装进 web profile；缺失时复制内置产物并 `dsh plugin add`（幂等）。
-async fn ensure_plugin(app: &AppHandle, state: &Arc<SharedState>) -> Result<(), String> {
-    eprintln!("[dscoder] ensure_plugin: enter, registered={}", plugin_registered());
-    if plugin_registered() {
-        // 已登记但产物被删时补拷（不自愈 link，仅恢复文件）。
-        if !plugin_install_dir().join("lib").join("index.js").exists() {
-            let Some(src) = locate_plugin_dir(app) else {
-                return Ok(()); // 登记在、无内置源 → 不做破坏性动作
-            };
-            let _ = copy_dir(&src, &plugin_install_dir());
+/// 确保单个插件已安装进 web profile；缺失时复制内置产物并 `dsh plugin add`（幂等）。
+async fn ensure_one_plugin(app: &AppHandle, state: &Arc<SharedState>, name: &str) -> Result<(), String> {
+    eprintln!("[dscoder] ensure_plugin({name}): registered={}", plugin_registered(name));
+    if plugin_registered(name) {
+        // 已登记：产物缺失或版本落后时，用内置源覆盖安装副本（link 指向该目录，覆盖即生效）。
+        let installed = plugin_install_dir(name);
+        let mut needs_heal = !installed.join("lib").join("index.js").exists();
+        if !needs_heal {
+            if let Some(src) = locate_plugin_dir(app, name) {
+                if plugin_version(&installed) != plugin_version(&src) {
+                    needs_heal = true;
+                }
+            }
+        }
+        if needs_heal {
+            if let Some(src) = locate_plugin_dir(app, name) {
+                let _ = copy_dir(&src, &installed);
+            }
         }
         return Ok(());
     }
@@ -219,16 +234,17 @@ async fn ensure_plugin(app: &AppHandle, state: &Arc<SharedState>) -> Result<(), 
             port: None,
             pid: None,
             attempt: 0,
-            message: Some("正在安装底部信息栏插件…".into()),
+            message: Some(format!("正在安装插件 {name}…")),
         },
     )
     .await;
-    eprintln!("[dscoder] ensure_plugin: status=provisioning(插件)");
+    eprintln!("[dscoder] ensure_plugin({name}): status=provisioning");
 
-    let src = locate_plugin_dir(app).ok_or("找不到内置插件 dsh-bottom-info-bar（资源缺失）")?;
-    eprintln!("[dscoder] ensure_plugin: src={}", src.display());
-    copy_dir(&src, &plugin_install_dir()).map_err(|e| format!("复制插件失败：{e}"))?;
-    eprintln!("[dscoder] ensure_plugin: copied to {}", plugin_install_dir().display());
+    let src = locate_plugin_dir(app, name)
+        .ok_or_else(|| format!("找不到内置插件 {name}（资源缺失）"))?;
+    eprintln!("[dscoder] ensure_plugin({name}): src={}", src.display());
+    copy_dir(&src, &plugin_install_dir(name)).map_err(|e| format!("复制插件失败：{e}"))?;
+    eprintln!("[dscoder] ensure_plugin({name}): copied to {}", plugin_install_dir(name).display());
 
     let bin = runtime_bin();
     let home = dsh_home();
@@ -238,9 +254,9 @@ async fn ensure_plugin(app: &AppHandle, state: &Arc<SharedState>) -> Result<(), 
         "--profile".to_string(),
         "web".to_string(),
         "add".to_string(),
-        plugin_install_dir().display().to_string(),
+        plugin_install_dir(name).display().to_string(),
     ];
-    eprintln!("[dscoder] ensure_plugin: running plugin add: node {:?}", args);
+    eprintln!("[dscoder] ensure_plugin({name}): running plugin add: node {:?}", args);
     run_program(
         "node",
         &args,
@@ -248,10 +264,18 @@ async fn ensure_plugin(app: &AppHandle, state: &Arc<SharedState>) -> Result<(), 
         "插件安装",
     )
     .await?;
-    eprintln!("[dscoder] ensure_plugin: plugin add done, registered={}", plugin_registered());
+    eprintln!("[dscoder] ensure_plugin({name}): plugin add done, registered={}", plugin_registered(name));
 
-    if !plugin_registered() {
-        return Err("插件安装后未在 web profile 生效".into());
+    if !plugin_registered(name) {
+        return Err(format!("插件 {name} 安装后未在 web profile 生效"));
+    }
+    Ok(())
+}
+
+/// 确保全部默认插件已安装（逐个幂等）。
+async fn ensure_plugins(app: &AppHandle, state: &Arc<SharedState>) -> Result<(), String> {
+    for name in DEFAULT_PLUGINS {
+        ensure_one_plugin(app, state, name).await?;
     }
     Ok(())
 }
@@ -264,9 +288,9 @@ pub async fn ensure_and_start(app: AppHandle, state: Arc<SharedState>) {
         fatal(&app, &state, e).await;
         return;
     }
-    eprintln!("[dscoder] ensure_and_start: ensure_plugin...");
-    if let Err(e) = ensure_plugin(&app, &state).await {
-        eprintln!("[dscoder] ensure_and_start: ensure_plugin ERROR: {e}");
+    eprintln!("[dscoder] ensure_and_start: ensure_plugins...");
+    if let Err(e) = ensure_plugins(&app, &state).await {
+        eprintln!("[dscoder] ensure_and_start: ensure_plugins ERROR: {e}");
         fatal(&app, &state, e).await;
         return;
     }
