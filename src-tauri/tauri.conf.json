@@ -4,17 +4,16 @@
   "version": "0.1.0",
   "identifier": "io.github.ztmajor.dscoder",
   "build": {
-    "beforeDevCommand": "pnpm dev",
-    "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "pnpm build",
     "frontendDist": "../dist"
   },
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "dscoder",
-        "width": 800,
-        "height": 600
+        "width": 1280,
+        "height": 800,
+        "visible": false
       }
     ],
     "security": {
