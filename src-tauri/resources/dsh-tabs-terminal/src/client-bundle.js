@@ -19,6 +19,7 @@ const TREE_DEFAULT_WIDTH = 240; // 文件树默认宽度 px
 const TREE_MIN_WIDTH = 180;
 const TREE_MAX_WIDTH = 520;
 const CHAT_TAB_KEY = '__chat__'; // 非关闭"聊天"标签的稳定标识
+const DIFF_GUTTER_WIDTH = 16; // 编辑器行内 diff 标记列宽 px（dsh-local-git 桥接）
 
 // rpc(method, args, timeoutMs)：POST JSON；超时/解析失败抛可读错误。
 function rpc(method, args, timeoutMs) {
@@ -258,11 +259,42 @@ function detectLang(name) {
   return '';
 }
 
-// 带语法高亮与行号的可编辑查看器：每行渲染为「行号 + 代码」的 flex 行，透明 textarea 覆盖在上面。
+// 带语法高亮与行号的可编辑查看器：每行渲染为「diff 标记 + 行号 + 代码」的 flex 行，
+// 透明 textarea 覆盖在上面；若存在 window.__dshLocalGit，则拉取行级 diff 做绿/红/蓝着色。
 function CodeEditor(props) {
   const taRef = React.useRef(null);
   const hlRef = React.useRef(null);
   const value = props.value || '';
+  const [diffMarks, setDiffMarks] = React.useState(null);
+
+  // 拉取行级 diff（相对 dsh-local-git 上次提交），250ms 防抖，避免每次按键都请求。
+  React.useEffect(function () {
+    let active = true;
+    const bridge = window.__dshLocalGit;
+    if (!bridge || typeof bridge.diffFile !== 'function' || !props.path || !props.workspace) {
+      setDiffMarks(null);
+      return undefined;
+    }
+    const timer = window.setTimeout(function () {
+      bridge.diffFile({ workspace: props.workspace, absPath: props.path, content: value }).then(function (r) {
+        if (!active) return;
+        if (r && r.ok && Array.isArray(r.lineTypes)) {
+          const hasDiff = r.lineTypes.some(function (t) { return t === 'add' || t === 'chg'; }) ||
+            (Array.isArray(r.deletionMarkers) && r.deletionMarkers.length > 0);
+          setDiffMarks(hasDiff ? { lineTypes: r.lineTypes, deletionMarkers: r.deletionMarkers || [] } : null);
+        } else {
+          setDiffMarks(null);
+        }
+      }).catch(function () { if (active) setDiffMarks(null); });
+    }, 250);
+    return function () { active = false; window.clearTimeout(timer); };
+  }, [value, props.path, props.workspace]);
+
+  // 滚动同步（无依赖，每次渲染后同步高亮层滚动位置到 textarea；超大文件路径下 ref 为 null 自动跳过）。
+  React.useEffect(function () {
+    const ta = taRef.current, hl = hlRef.current;
+    if (ta && hl) hl.scrollTop = ta.scrollTop;
+  });
 
   // 超大文件退回纯 textarea（不建行号/高亮层，避免卡顿）。
   if (value.length > HIGHLIGHT_MAX_CHARS) {
@@ -284,29 +316,47 @@ function CodeEditor(props) {
   const lineCount = value.split('\n').length;
   const digits = String(Math.max(1, lineCount)).length;
   const gutterWidth = Math.max(32, digits * 8 + 20);
-
-  React.useEffect(function () {
-    const ta = taRef.current, hl = hlRef.current;
-    if (ta && hl) hl.scrollTop = ta.scrollTop;
-  });
+  const showDiff = !!diffMarks;
 
   function syncScroll() {
     const ta = taRef.current, hl = hlRef.current;
     if (ta && hl) hl.scrollTop = ta.scrollTop;
   }
 
-  const lineNodes = [];
-  for (let i = 0; i < lines.length; i++) {
-    lineNodes.push(React.createElement('div', { className: 'dtt-line', key: i },
-      React.createElement('span', { className: 'dtt-line-num', style: { width: gutterWidth + 'px' } }, String(i + 1)),
-      React.createElement('span', { className: 'dtt-line-code', dangerouslySetInnerHTML: { __html: lines[i] } }),
-    ));
+  // 计算每行 diff 标记（gutter 文本 + 行样式类）。增=绿、改=蓝、删=红（删除行不在正文，仅 gutter 红标）。
+  const gutterMarks = new Array(lines.length + 1).fill('');
+  if (showDiff && Array.isArray(diffMarks.lineTypes)) {
+    for (let i = 0; i < diffMarks.lineTypes.length && i < lines.length; i++) {
+      const t = diffMarks.lineTypes[i];
+      if (t === 'add') gutterMarks[i] = 'add:+';
+      else if (t === 'chg') gutterMarks[i] = 'chg:~';
+    }
+    const dels = Array.isArray(diffMarks.deletionMarkers) ? diffMarks.deletionMarkers : [];
+    for (const d of dels) {
+      const p = Math.max(0, Math.min(lines.length, Number(d.at) || 0));
+      gutterMarks[p] = 'del:−' + (d.count > 1 ? d.count : '');
+    }
   }
+
+  function makeLine(i, codeHtml) {
+    const gm = gutterMarks[i] || '';
+    const sep = gm.indexOf(':');
+    const kind = sep >= 0 ? gm.slice(0, sep) : '';
+    const text = sep >= 0 ? gm.slice(sep + 1) : '';
+    const lineCls = 'dtt-line' + (kind === 'add' ? ' dtt-diff-add' : kind === 'chg' ? ' dtt-diff-chg' : '');
+    const codeProps = { className: 'dtt-line-code' };
+    if (codeHtml != null) codeProps.dangerouslySetInnerHTML = { __html: codeHtml };
+    return React.createElement('div', { className: lineCls, key: i },
+      showDiff ? React.createElement('span', { className: 'dtt-diff-gutter g-' + (kind || 'none') }, text) : null,
+      React.createElement('span', { className: 'dtt-line-num', style: { width: gutterWidth + 'px' } }, String(i + 1)),
+      React.createElement('span', codeProps),
+    );
+  }
+
+  const lineNodes = [];
+  for (let i = 0; i < lines.length; i++) lineNodes.push(makeLine(i, lines[i]));
   // textarea 始终有一个末尾空行，这里补一行保持一致。
-  lineNodes.push(React.createElement('div', { className: 'dtt-line', key: lines.length },
-    React.createElement('span', { className: 'dtt-line-num', style: { width: gutterWidth + 'px' } }, String(lines.length + 1)),
-    React.createElement('span', { className: 'dtt-line-code' }),
-  ));
+  lineNodes.push(makeLine(lines.length, null));
 
   return React.createElement('div', { className: 'dtt-editor-wrap' },
     React.createElement('pre', {
@@ -317,7 +367,7 @@ function CodeEditor(props) {
     React.createElement('textarea', {
       className: 'dtt-reader-body dtt-editor dtt-editor-overlay',
       ref: taRef,
-      style: { paddingLeft: (16 + gutterWidth) + 'px' },
+      style: { paddingLeft: (16 + (showDiff ? DIFF_GUTTER_WIDTH : 0) + gutterWidth) + 'px' },
       value: value,
       spellCheck: false,
       wrap: 'soft',
@@ -510,6 +560,15 @@ function installStyles() {
       color: var(--dsw-alias-label-tertiary, #7f848e);
     }
     .dtt-line-code { flex: 1 1 auto; min-width: 0; white-space: pre-wrap; word-break: break-all; }
+    .dtt-diff-gutter {
+      flex: 0 0 auto; box-sizing: border-box; width: 16px; text-align: center;
+      font-size: 11px; line-height: inherit; color: transparent; user-select: none; white-space: pre;
+    }
+    .dtt-diff-gutter.g-add { color: #16a34a; }
+    .dtt-diff-gutter.g-chg { color: #2563eb; }
+    .dtt-diff-gutter.g-del { color: #dc2626; font-weight: 700; }
+    .dtt-line.dtt-diff-add { background: rgba(34,197,94,0.15); }
+    .dtt-line.dtt-diff-chg { background: rgba(59,130,246,0.15); }
     .dtt-reader-body.dtt-editor.dtt-editor-overlay {
       position: absolute; inset: 0; height: 100%;
       color: transparent; caret-color: var(--dsw-alias-label-primary, #0f1115);
@@ -542,7 +601,14 @@ function installStyles() {
     .dtt-reader-status { flex: 0 0 auto; color: var(--dsw-alias-state-warn-primary, #d97706); }
     .dtt-reader-status.error { color: var(--dsw-alias-state-error-primary, #dc2626); }
     .dtt-tab-dirty { flex: 0 0 auto; color: var(--dsw-alias-state-warn-primary, #d97706); font-weight: 700; }
-    .dtt-reader-error { margin: 16px; padding: 12px; border-radius: 8px; color: var(--dsw-alias-state-error-primary, #dc2626); background: rgba(220,38,38,0.08); font-size: 13px; }
+    .dtt-reader-error {
+      flex: 1 1 auto; min-height: 0;
+      display: flex; align-items: center; justify-content: center;
+      margin: 0; padding: 24px; text-align: center;
+      color: var(--dsw-alias-state-error-primary, #dc2626);
+      background: var(--dsw-alias-bg-base, #fff);
+      font-size: 13px; pointer-events: auto;
+    }
     .dtt-reader-loading { margin: 16px; color: var(--dsw-alias-label-tertiary, rgba(128,128,128,0.9)); font-size: 13px; }
 
     /* ---------- 终端面板 ---------- */
@@ -801,6 +867,7 @@ module.exports = {
       const [treeRoot, setTreeRoot] = React.useState(null); // null → 自动取工作区/主目录
       const [terminalOpen, setTerminalOpen] = React.useState(false);
       const [terminalAlive, setTerminalAlive] = React.useState(false);
+      const [localGitOpen, setLocalGitOpen] = React.useState(false); // 本地版本管理面板可见性（由 dsh-local-git 广播同步）
       const [pendingClose, setPendingClose] = React.useState(null); // { path, paneId }
 
       // 聚焦 pane 与当前激活文件（派生值）
@@ -817,6 +884,23 @@ module.exports = {
         setTerminalOpen(false);
         setTerminalAlive(false);
       }
+
+      // 切换本地版本管理面板：经 window.__dshLocalGit 转发给 dsh-local-git 插件。
+      function toggleLocalGit() {
+        if (window.__dshLocalGit && typeof window.__dshLocalGit.toggle === 'function') {
+          window.__dshLocalGit.toggle();
+        }
+      }
+
+      // 同步面板可见性（dsh-local-git 广播），用于顶部图标按钮的激活态。
+      React.useEffect(function () {
+        function onVis(e) {
+          const open = !!(e && e.detail && e.detail.open);
+          setLocalGitOpen(open);
+        }
+        window.addEventListener('dsh-local-git:visibility', onVis);
+        return function () { window.removeEventListener('dsh-local-git:visibility', onVis); };
+      }, []);
 
       // 键盘快捷键（Ctrl+S 保存）需访问最新状态：用 ref 快照，避免闭包过期。
       const stateRef = React.useRef({ openFiles: openFiles, activeTab: activeTab });
@@ -1053,6 +1137,11 @@ module.exports = {
           React.createElement('div', { className: 'dtt-spacer' }),
           pane.id === focusedPane.id ? React.createElement(React.Fragment, null,
             React.createElement('button', {
+              className: 'dtt-tabbar-btn' + (localGitOpen ? ' active' : ''),
+              title: '本地版本管理', type: 'button',
+              onClick: toggleLocalGit,
+            }, localGitOpen ? svgIcon('local-version-manage-open.svg', '本地版本管理') : svgIcon('local-version-manage.svg', '本地版本管理')),
+            React.createElement('button', {
               className: 'dtt-tabbar-btn' + (treeOpen ? ' active' : ''),
               title: '切换文件树', type: 'button',
               onClick: function () { setTreeOpen(function (v) { return !v; }); },
@@ -1084,6 +1173,8 @@ module.exports = {
           else body = React.createElement(CodeEditor, {
             name: f.name,
             value: f.content,
+            path: f.path,
+            workspace: resolveWorkspaceRoot(),
             onChange: function (v) { onEditFile(f.path, v); },
           });
         }

@@ -1,0 +1,6 @@
+# dsh-local-git bundle patch: mounts the plugin into a profile layer stack.
+# The plugin row id is 'dsh-local-git' — users may override its behavior in
+# their profile's cordis.patch.yml with a row carrying the same id.
+- insert:
+    - id: dsh-local-git
+      name: 'dsh-local-git'

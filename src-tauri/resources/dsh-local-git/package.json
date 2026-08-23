@@ -1,0 +1,48 @@
+{
+  "name": "dsh-local-git",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness 本地快照版本管理插件：无需云端 git 仓库，在工作区 .dsh-git 内保存本地快照，提供改动列表、行级 diff（增绿/删红/改蓝）、提交信息与历史回退；与真实 .git 完全隔离，不影响 GitHub/Gitee。",
+  "keywords": [
+    "deepseek",
+    "deepseek-harness",
+    "dsh",
+    "dsh-local-git",
+    "local-git",
+    "version-control",
+    "snapshot",
+    "diff"
+  ],
+  "author": "DSCoder",
+  "license": "MIT",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "react": "^18.0.0"
+  }
+}

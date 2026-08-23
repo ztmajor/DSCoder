@@ -1,0 +1,609 @@
+// dsh-local-git（本地快照版本管理）— host half（静态 bundle 形态）
+// 业务：在工作区根目录 .dsh-git/ 内维护一个「本地快照仓库」（内容寻址对象存储 +
+//       提交清单 + HEAD 指针），提供改动列表 / 行级 diff / 提交 / 历史 / 回退。
+// 与真实 .git 完全隔离：既不读取也不修改 .git，不影响 GitHub/Gitee 等现有 git。
+// RPC：webServer HTTP 路由（POST /_dsh/dsh-local-git/<method>，JSON 进出，同源防护）。
+// 依赖：webServer 经 ctx.inject 等待（web profile 必然存在）。
+import { mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { dirname, isAbsolute, join, relative } from 'node:path'
+
+// ---------- 常量 ----------
+const ROUTE_PREFIX = '/_dsh/dsh-local-git'
+const REPO_DIRNAME = '.dsh-git'
+const OBJECTS_DIR = 'objects'
+const COMMITS_DIR = 'commits'
+const HEAD_FILE = 'HEAD'
+const CONFIG_FILE = 'config.json'
+
+const MAX_TRACK_BYTES = 4 * 1024 * 1024      // 单文件跟踪上限 4MB
+const MAX_DIFF_BYTES = 1024 * 1024           // 行级 diff 上限 1MB（超过只标记「已修改」）
+const MAX_DIFF_LINES = 20000                 // 行级 diff 行数上限
+const MAX_WALK_FILES = 20000                 // 单次遍历文件数上限（防失控）
+
+// 遍历时跳过的目录（派生/缓存/依赖/版本库目录）。
+const IGNORE_DIRS = new Set([
+  '.git', '.dsh-git', 'node_modules', 'dist', 'target', '.next', '.nuxt',
+  '.cache', '.parcel-cache', 'build', 'out', 'coverage', '__pycache__',
+  '.pytest_cache', '.mypy_cache', '.venv', 'venv', '.tox', '.eggs',
+])
+
+// ---------- 工具 ----------
+function hashBuf(buf) {
+  return createHash('sha256').update(buf).digest('hex')
+}
+
+// 文本文件是否含 NUL 字节（二进制判定；仅探测前 8KB）。
+function looksBinary(buf) {
+  const probe = buf.length <= 8192 ? buf : buf.subarray(0, 8192)
+  for (let i = 0; i < probe.length; i++) {
+    if (probe[i] === 0) return true
+  }
+  return false
+}
+
+// 相对路径统一用 '/' 分隔（跨平台稳定，清单与 diff 均用它）。
+function toRel(root, abs) {
+  return relative(root, abs).split('\\').join('/')
+}
+
+async function writeJSON(p, obj) {
+  await writeFile(p, JSON.stringify(obj), 'utf8')
+}
+
+async function readJSON(p) {
+  try {
+    return JSON.parse(await readFile(p, 'utf8'))
+  } catch (err) {
+    return null
+  }
+}
+
+// ---------- 仓库路径 ----------
+function repoRoot(ws) { return join(ws, REPO_DIRNAME) }
+function objectsDir(ws) { return join(repoRoot(ws), OBJECTS_DIR) }
+function commitDir(ws, id) { return join(repoRoot(ws), COMMITS_DIR, id) }
+function headPath(ws) { return join(repoRoot(ws), HEAD_FILE) }
+function configPath(ws) { return join(repoRoot(ws), CONFIG_FILE) }
+
+async function isEnabled(ws) {
+  try {
+    await stat(configPath(ws))
+    return true
+  } catch (err) {
+    return false
+  }
+}
+
+async function readHEAD(ws) {
+  try {
+    const s = await readFile(headPath(ws), 'utf8')
+    const id = s.trim()
+    return id || 'empty'
+  } catch (err) {
+    return 'empty'
+  }
+}
+
+async function loadTree(ws, commitId) {
+  if (!commitId || commitId === 'empty') return {}
+  const tree = await readJSON(join(commitDir(ws, commitId), 'tree.json'))
+  return tree || {}
+}
+
+async function readBlob(ws, hash) {
+  try {
+    return await readFile(join(objectsDir(ws), hash))
+  } catch (err) {
+    return null
+  }
+}
+
+async function writeBlob(ws, hash, buf) {
+  await writeFile(join(objectsDir(ws), hash), buf)
+}
+
+// ---------- 工作区遍历 ----------
+// 递归收集可跟踪的文本文件，返回 { relPath: { hash, size } }。
+async function walkTracked(ws) {
+  const map = {}
+  let count = 0
+
+  async function walk(dir) {
+    let dirents
+    try {
+      dirents = await readdir(dir, { withFileTypes: true })
+    } catch (err) {
+      return
+    }
+    for (const d of dirents) {
+      if (d.name === REPO_DIRNAME || d.name === '.git') continue
+      const full = join(dir, d.name)
+      if (d.isDirectory()) {
+        if (IGNORE_DIRS.has(d.name)) continue
+        await walk(full)
+      } else if (d.isFile()) {
+        if (count >= MAX_WALK_FILES) return
+        let st
+        try { st = await stat(full) } catch (err) { continue }
+        if (st.size > MAX_TRACK_BYTES) continue
+        let buf
+        try { buf = await readFile(full) } catch (err) { continue }
+        if (looksBinary(buf)) continue
+        count += 1
+        map[toRel(ws, full)] = { hash: hashBuf(buf), size: st.size }
+      }
+    }
+  }
+
+  await walk(ws)
+  return map
+}
+
+// ---------- diff（行级，LCS 前缀/后缀裁剪 + 中间 DP） ----------
+function diffLines(oldLines, newLines) {
+  const a = oldLines
+  const b = newLines
+
+  // 公共前缀 / 后缀裁剪（局部编辑最常见形态）。
+  let pre = 0
+  while (pre < a.length && pre < b.length && a[pre] === b[pre]) pre += 1
+  let suf = 0
+  while (
+    suf < a.length - pre && suf < b.length - pre &&
+    a[a.length - 1 - suf] === b[b.length - 1 - suf]
+  ) suf += 1
+
+  const am = a.slice(pre, a.length - suf)
+  const bm = b.slice(pre, b.length - suf)
+  const mid = middleDiff(am, bm)
+
+  const ops = []
+  if (pre > 0) ops.push({ kind: 'equal', oldStart: 0, oldCount: pre, newStart: 0, newCount: pre })
+  for (const op of mid) {
+    ops.push({ kind: op.kind, oldStart: op.oldStart + pre, oldCount: op.oldCount, newStart: op.newStart + pre, newCount: op.newCount })
+  }
+  if (suf > 0) ops.push({ kind: 'equal', oldStart: a.length - suf, oldCount: suf, newStart: b.length - suf, newCount: suf })
+
+  // 派生行标注（覆盖 newLines）与删除标记（用于行内 gutter 红点）。
+  const lineTypes = []
+  const deletionMarkers = []
+  let newIndex = 0
+  for (const op of ops) {
+    if (op.kind === 'equal') {
+      for (let k = 0; k < op.newCount; k++) lineTypes.push('same')
+    } else if (op.kind === 'insert') {
+      for (let k = 0; k < op.newCount; k++) lineTypes.push('add')
+    } else if (op.kind === 'delete') {
+      deletionMarkers.push({ at: newIndex, count: op.oldCount })
+    } else if (op.kind === 'replace') {
+      for (let k = 0; k < op.newCount; k++) lineTypes.push('chg')
+      deletionMarkers.push({ at: newIndex, count: op.oldCount })
+    }
+    newIndex += op.newCount
+  }
+  return { ops, lineTypes, deletionMarkers }
+}
+
+function middleDiff(a, b) {
+  const n = a.length
+  const m = b.length
+  if (n === 0 && m === 0) return []
+  if (n === 0) return [{ kind: 'insert', oldStart: 0, oldCount: 0, newStart: 0, newCount: m }]
+  if (m === 0) return [{ kind: 'delete', oldStart: 0, oldCount: n, newStart: 0, newCount: 0 }]
+  if (n * m > 4_000_000) {
+    // 中部过大：退化为单块替换，避免 DP 内存/耗时失控。
+    return [{ kind: 'replace', oldStart: 0, oldCount: n, newStart: 0, newCount: m }]
+  }
+
+  const dp = new Array(n + 1)
+  for (let i = 0; i <= n; i++) dp[i] = new Array(m + 1).fill(0)
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1])
+    }
+  }
+
+  const ops = []
+  let i = 0
+  let j = 0
+  while (i < n && j < m) {
+    if (a[i] === b[j]) {
+      let i2 = i
+      let j2 = j
+      while (i2 < n && j2 < m && a[i2] === b[j2]) { i2 += 1; j2 += 1 }
+      ops.push({ kind: 'equal', oldStart: i, oldCount: i2 - i, newStart: j, newCount: j2 - j })
+      i = i2
+      j = j2
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+      ops.push({ kind: 'delete', oldStart: i, oldCount: 1, newStart: j, newCount: 0 })
+      i += 1
+    } else {
+      ops.push({ kind: 'insert', oldStart: i, oldCount: 0, newStart: j, newCount: 1 })
+      j += 1
+    }
+  }
+  if (i < n) ops.push({ kind: 'delete', oldStart: i, oldCount: n - i, newStart: j, newCount: 0 })
+  if (j < m) ops.push({ kind: 'insert', oldStart: i, oldCount: 0, newStart: j, newCount: m - j })
+  return mergeOps(ops)
+}
+
+function mergeOps(ops) {
+  const out = []
+  for (const op of ops) {
+    const last = out[out.length - 1]
+    if (!last) { out.push({ ...op }); continue }
+    if (op.kind === 'equal') {
+      if (last.kind === 'equal') { last.oldCount += op.oldCount; last.newCount += op.newCount }
+      else out.push({ ...op })
+    } else if (op.kind === 'delete') {
+      if (last.kind === 'delete') last.oldCount += op.oldCount
+      else out.push({ ...op })
+    } else if (op.kind === 'insert') {
+      if (last.kind === 'insert') last.newCount += op.newCount
+      else if (last.kind === 'delete') {
+        out[out.length - 1] = { kind: 'replace', oldStart: last.oldStart, oldCount: last.oldCount, newStart: last.newStart, newCount: op.newCount }
+      } else out.push({ ...op })
+    }
+  }
+  return out
+}
+
+// ---------- RPC 业务 ----------
+function getWorkspace(args) {
+  const p = (args && (args.workspace || args.workspaceRoot)) || ''
+  if (typeof p !== 'string' || !p || !isAbsolute(p)) return ''
+  return p
+}
+
+// 把当前工作区内容构建为一次提交（写对象、建提交、推进 HEAD）。
+// 返回 { changed, commitId, added, deleted, modified }；无改动时 changed=false 且不推进 HEAD。
+async function buildCommit(ws, message) {
+  const head = await readHEAD(ws)
+  const headTree = await loadTree(ws, head)
+  const working = await walkTracked(ws)
+
+  const added = []
+  const deleted = []
+  const modified = []
+  for (const rel in working) {
+    if (!(rel in headTree)) added.push(rel)
+    else if (headTree[rel].hash !== working[rel].hash) modified.push(rel)
+  }
+  for (const rel in headTree) {
+    if (!(rel in working)) deleted.push(rel)
+  }
+  added.sort()
+  deleted.sort()
+  modified.sort()
+
+  if (added.length === 0 && deleted.length === 0 && modified.length === 0) {
+    return { changed: false, commitId: null, added, deleted, modified }
+  }
+
+  // 写入新增/修改文件的对象（内容寻址）。
+  for (const rel of added.concat(modified)) {
+    let buf
+    try { buf = await readFile(join(ws, rel)) } catch (err) { continue }
+    await writeBlob(ws, working[rel].hash, buf)
+  }
+
+  // 构造新提交树（本次提交后的完整清单）。
+  const tree = {}
+  for (const rel in working) tree[rel] = { hash: working[rel].hash, size: working[rel].size }
+
+  const ts = Date.now()
+  const commitId = 'c' + ts.toString(36) + '-' +
+    createHash('sha256').update((head || 'empty') + '\0' + JSON.stringify(tree)).digest('hex').slice(0, 8)
+
+  const commitPath = commitDir(ws, commitId)
+  await mkdir(commitPath, { recursive: true })
+  await writeJSON(join(commitPath, 'meta.json'), {
+    id: commitId, ts, message, parent: head || 'empty',
+  })
+  await writeJSON(join(commitPath, 'tree.json'), tree)
+  await writeFile(headPath(ws), commitId, 'utf8')
+
+  return { changed: true, commitId, added, deleted, modified }
+}
+
+async function initRpc(args) {
+  const ws = getWorkspace(args)
+  if (!ws) return { ok: false, error: '需要工作区绝对路径' }
+  const root = repoRoot(ws)
+  await mkdir(join(root, OBJECTS_DIR), { recursive: true })
+  await mkdir(join(root, COMMITS_DIR), { recursive: true })
+  await writeFile(headPath(ws), 'empty', 'utf8')
+  await writeJSON(configPath(ws), { version: 1, createdAt: Date.now() })
+  // 启用即把当前工作区内容作为「init」基线提交存好，避免刚启用就显示一堆未提交的新增文件。
+  const initial = await buildCommit(ws, 'init')
+  return { ok: true, initialCommitId: initial.commitId }
+}
+
+async function enabledRpc(args) {
+  const ws = getWorkspace(args)
+  if (!ws) return { ok: false, error: '需要工作区绝对路径' }
+  return { ok: true, enabled: await isEnabled(ws) }
+}
+
+async function statusRpc(args) {
+  const ws = getWorkspace(args)
+  if (!ws) return { ok: false, error: '需要工作区绝对路径' }
+  const enabled = await isEnabled(ws)
+  if (!enabled) return { ok: true, enabled: false, head: 'empty', added: [], deleted: [], modified: [] }
+
+  const head = await readHEAD(ws)
+  const headTree = await loadTree(ws, head)
+  const working = await walkTracked(ws)
+
+  const added = []
+  const deleted = []
+  const modified = []
+  for (const rel in working) {
+    if (!(rel in headTree)) added.push(rel)
+    else if (headTree[rel].hash !== working[rel].hash) modified.push(rel)
+  }
+  for (const rel in headTree) {
+    if (!(rel in working)) deleted.push(rel)
+  }
+  added.sort()
+  deleted.sort()
+  modified.sort()
+
+  return { ok: true, enabled: true, head, added, deleted, modified }
+}
+
+async function diffFileRpc(args) {
+  const ws = getWorkspace(args)
+  if (!ws) return { ok: false, error: '需要工作区绝对路径' }
+  const relPath = String((args && (args.relPath || args.path)) || '').replace(/\\/g, '/')
+  if (!relPath || relPath.startsWith('../') || relPath.indexOf('\0') >= 0) {
+    return { ok: false, error: '非法路径' }
+  }
+
+  const head = await readHEAD(ws)
+  const headTree = await loadTree(ws, head)
+  const oldEntry = headTree[relPath]
+
+  let newContent = null
+  if (typeof (args && args.content) === 'string') {
+    newContent = args.content
+  } else {
+    try { newContent = await readFile(join(ws, relPath), 'utf8') } catch (err) { newContent = null }
+  }
+
+  // 新增文件：全部为 add。
+  if (!oldEntry) {
+    if (newContent === null) return { ok: false, error: '文件不存在' }
+    const newLines = newContent.split('\n')
+    return {
+      ok: true, relPath, status: 'added',
+      oldLines: [], newLines: newLines,
+      ops: [{ kind: 'insert', oldStart: 0, oldCount: 0, newStart: 0, newCount: newLines.length }],
+      lineTypes: newLines.map(function () { return 'add' }),
+      deletionMarkers: [],
+    }
+  }
+
+  let oldBuf = await readBlob(ws, oldEntry.hash)
+  if (oldBuf === null) {
+    // 对象缺失（罕见，可能被手动清理）：视为新增。
+    if (newContent === null) return { ok: false, error: '文件不存在' }
+    const newLines = newContent.split('\n')
+    return {
+      ok: true, relPath, status: 'added',
+      oldLines: [], newLines: newLines,
+      ops: [{ kind: 'insert', oldStart: 0, oldCount: 0, newStart: 0, newCount: newLines.length }],
+      lineTypes: newLines.map(function () { return 'add' }),
+      deletionMarkers: [],
+    }
+  }
+  const oldContent = oldBuf.toString('utf8')
+
+  if (newContent === null) {
+    // 已删除文件。
+    const oldLines = oldContent.split('\n')
+    return {
+      ok: true, relPath, status: 'deleted',
+      oldLines: oldLines, newLines: [],
+      ops: [{ kind: 'delete', oldStart: 0, oldCount: oldLines.length, newStart: 0, newCount: 0 }],
+      lineTypes: [],
+      deletionMarkers: [{ at: 0, count: oldLines.length }],
+    }
+  }
+
+  if (oldContent === newContent) {
+    return { ok: true, relPath, status: 'unchanged', oldLines: [], newLines: [], ops: [], lineTypes: [], deletionMarkers: [] }
+  }
+
+  const oldLines = oldContent.split('\n')
+  const newLines = newContent.split('\n')
+  if (
+    oldContent.length > MAX_DIFF_BYTES || newContent.length > MAX_DIFF_BYTES ||
+    oldLines.length > MAX_DIFF_LINES || newLines.length > MAX_DIFF_LINES
+  ) {
+    return {
+      ok: true, relPath, status: 'modified', truncated: true,
+      oldLines: [], newLines: [],
+      ops: [{ kind: 'replace', oldStart: 0, oldCount: oldLines.length, newStart: 0, newCount: newLines.length }],
+      lineTypes: newLines.map(function () { return 'chg' }),
+      deletionMarkers: [],
+    }
+  }
+
+  const { ops, lineTypes, deletionMarkers } = diffLines(oldLines, newLines)
+  return {
+    ok: true, relPath, status: 'modified',
+    oldLines: oldLines, newLines: newLines,
+    ops: ops, lineTypes: lineTypes, deletionMarkers: deletionMarkers,
+  }
+}
+
+async function commitRpc(args) {
+  const ws = getWorkspace(args)
+  if (!ws) return { ok: false, error: '需要工作区绝对路径' }
+  if (!(await isEnabled(ws))) return { ok: false, error: '尚未启用本地版本管理，请先初始化' }
+
+  const message = String((args && args.message) || '').trim()
+  if (!message) return { ok: false, error: '请填写提交信息' }
+
+  const r = await buildCommit(ws, message)
+  if (!r.changed) return { ok: false, error: '没有需要提交的改动' }
+  return { ok: true, commitId: r.commitId, added: r.added, deleted: r.deleted, modified: r.modified }
+}
+
+async function logRpc(args) {
+  const ws = getWorkspace(args)
+  if (!ws) return { ok: false, error: '需要工作区绝对路径' }
+  if (!(await isEnabled(ws))) return { ok: true, commits: [] }
+
+  const commits = []
+  let id = await readHEAD(ws)
+  let guard = 0
+  while (id && id !== 'empty' && guard < 1000) {
+    const meta = await readJSON(join(commitDir(ws, id), 'meta.json'))
+    if (!meta) break
+    commits.push({ id, ts: meta.ts, message: meta.message })
+    id = (meta.parent || 'empty')
+    guard += 1
+  }
+  return { ok: true, commits }
+}
+
+async function rollbackRpc(args) {
+  const ws = getWorkspace(args)
+  if (!ws) return { ok: false, error: '需要工作区绝对路径' }
+  if (!(await isEnabled(ws))) return { ok: false, error: '尚未启用本地版本管理' }
+  const commitId = String((args && args.commitId) || '')
+  if (!commitId) return { ok: false, error: '缺少目标提交' }
+
+  const tree = await readJSON(join(commitDir(ws, commitId), 'tree.json'))
+  if (!tree) return { ok: false, error: '目标提交不存在' }
+
+  const working = await walkTracked(ws)
+
+  // 删除工作区中不在目标快照里的文件（新提交后新增的文件）。
+  for (const rel in working) {
+    if (!(rel in tree)) {
+      try { await rm(join(ws, rel), { force: true }) } catch (err) { /* 忽略 */ }
+    }
+  }
+
+  // 按目标快照写回所有文件。
+  let restored = 0
+  for (const rel in tree) {
+    const blob = await readBlob(ws, tree[rel].hash)
+    if (blob === null) continue
+    const abs = join(ws, rel)
+    await mkdir(dirname(abs), { recursive: true })
+    await writeFile(abs, blob)
+    restored += 1
+  }
+
+  return { ok: true, restored, target: commitId }
+}
+
+// ---------- HTTP 工具 ----------
+function sameOrigin(req) {
+  const fetchSite = req.headers['sec-fetch-site']
+  if (fetchSite === 'cross-site') return false
+  const origin = req.headers.origin
+  if (origin === undefined) return fetchSite === 'same-origin' || fetchSite === 'same-site' || fetchSite === 'none'
+  const host = req.headers.host
+  if (host === undefined) return false
+  try {
+    const parsed = new URL(origin)
+    return (parsed.protocol === 'http:' || parsed.protocol === 'https:') && parsed.host === host
+  } catch {
+    return false
+  }
+}
+
+function readBody(req, maxBytes) {
+  return new Promise(function (resolve, reject) {
+    const chunks = []
+    let size = 0
+    req.on('data', function (chunk) {
+      size += chunk.length
+      if (size > maxBytes) {
+        const err = new Error('body too large')
+        err.status = 413
+        reject(err)
+        req.destroy()
+        return
+      }
+      chunks.push(chunk)
+    })
+    req.on('end', function () { resolve(Buffer.concat(chunks).toString('utf8')) })
+    req.on('error', reject)
+  })
+}
+
+function respond(res, status, payload) {
+  const body = JSON.stringify(payload)
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': Buffer.byteLength(body),
+    'Cache-Control': 'no-store',
+  })
+  res.end(body)
+}
+
+// ---------- 插件入口 ----------
+export default {
+  apply(ctx) {
+    const ROUTES = {
+      init: initRpc,
+      enabled: enabledRpc,
+      status: statusRpc,
+      diffFile: diffFileRpc,
+      commit: commitRpc,
+      log: logRpc,
+      rollback: rollbackRpc,
+    }
+
+    ctx.inject(['webServer'], function (webCtx) {
+      webCtx.effect(function () {
+        const dispose = webCtx.webServer.register({
+          kind: 'prefix',
+          path: ROUTE_PREFIX,
+          handler: async function (req, res) {
+            try {
+              const url = new URL(req.url || '/', 'http://localhost')
+              const path = url.pathname
+              if (!path.startsWith(ROUTE_PREFIX + '/')) {
+                respond(res, 404, { error: 'not found' })
+                return
+              }
+              if (!sameOrigin(req)) {
+                respond(res, 403, { error: 'cross-origin request rejected' })
+                return
+              }
+              const method = decodeURIComponent(path.slice(ROUTE_PREFIX.length + 1))
+              const fn = Object.hasOwn(ROUTES, method) ? ROUTES[method] : null
+              if (typeof fn !== 'function') {
+                respond(res, 404, { error: 'unknown method: ' + method })
+                return
+              }
+              let args = {}
+              if (req.method === 'POST' || req.method === 'PUT') {
+                const raw = await readBody(req, 64 * 1024)
+                if (raw.length > 0) {
+                  try { args = JSON.parse(raw) } catch (e) { respond(res, 400, { error: 'invalid JSON body' }); return }
+                }
+              }
+              const result = await fn(args)
+              respond(res, 200, result)
+            } catch (err) {
+              const status = (err && err.status) || 500
+              respond(res, status, { error: status === 500 ? 'internal error' : String((err && err.message) || err) })
+            }
+          },
+        })
+        return function () { dispose() }
+      }, 'dsh-local-git: Web routes')
+    })
+
+    return function () { /* 无持久资源需要清理 */ }
+  },
+}
