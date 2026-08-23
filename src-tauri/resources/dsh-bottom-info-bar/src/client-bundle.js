@@ -3,10 +3,13 @@
 // - ctx.interval / ctx.timeout → window.setInterval / window.setTimeout
 // - styles.insert(css) → document 注入 <style>（installStyles）
 // - React 由 bundle 的 require('react') 提供（seed 模块）
-// 样式策略：① 只把数字加粗（.bi-num 700）② 服务商名加粗 ③ 高峰价琥珀色+加粗、空闲价绿色+加粗
-// 显示行为：① 本对话花费始终显示——新会话/对话刚开始（尚无记账）时显示"本对话 ¥0.000"，
-//   hover 仍可查看持久化的 今天/近一月/全部；
-//   ② 完整模式下原生统计行无 steps 门槛，对话刚开始即显示"0 轮 · 0 步"。
+// 位置：会话头部右侧工具区（conversation.session.header.utilities，与 Session log 同槽、位于其左侧），
+//   单行胶囊外壳（与 nL4_yW_sessionLogButton 一致的椭圆长条）。
+// 交互：点击胶囊跳转 https://platform.deepseek.com/top_up；是否显示由 dsh-ui-tweaks
+//   设置页「界面调整 → 功能 → 价格面板」开关控制。
+// 样式策略：① 只把数字加粗（.bi-num 700）② 高峰价琥珀色+加粗、空闲价绿色+加粗
+// 显示行为：本对话花费始终显示——新会话/对话刚开始（尚无记账）时显示"本对话 ¥0.000"，
+//   hover 仍可查看持久化的 今天/近一月/全部。
 // 失败策略（AUDIT-CODE-REVIEW 缺陷 #1）：逐接口容错——
 //   ① rpc 带 20s 超时且可被外部 AbortSignal 中止（组件卸载即取消），杜绝永久"加载中…"；
 //   ② load 用 Promise.allSettled 逐端点处理：成功端点写新值，失败端点保留旧值并记入 errors 表；
@@ -17,9 +20,6 @@ const React = require('react');
 
 const RPC_BASE = '/_dsh/dsh-bottom-info-bar';
 
-// 排版优化（正式版）：完整模式下隐藏"首 token 平均 / tok/s"两个低优先级原生字段，
-// 让原生统计行在 748px 对话宽度下单行放得下；hover 信息浮窗（title）仍显示全部原生信息。
-const HIDE_SPEED_FIELDS = true;
 // 订阅窗口预警阈值：任一窗口已用百分比 ≥ 该值 → 红色 ⚠（与 host 常量保持一致）
 const WINDOW_ALERT_PERCENT = 90;
 
@@ -97,14 +97,11 @@ function installStyles() {
   style.dataset.plugin = 'dsh-bottom-info-bar';
   style.dataset.pluginCss = id;
   style.textContent = `
-      .bi-root { text-align: center; max-width: var(--dsh-chat-content-width); box-sizing: border-box; width: 100%; padding: 4px calc(var(--dsh-composer-side-clearance) + 16px) 0px; margin: 0 auto; display: block; overflow: hidden; font-size: 12px; line-height: 20px; color: var(--dsw-alias-label-tertiary, rgba(128,128,128,0.9)); font-variant-numeric: tabular-nums; cursor: pointer; }
-      .bi-native-row { display: flex; flex-wrap: wrap; justify-content: center; align-items: center; width: 100%; }
-      .bi-row2 { display: flex; flex-wrap: wrap; justify-content: center; align-items: center; width: 100%; }
-      .bi-native-row > span, .bi-row2 > span { white-space: nowrap; }
+      .bi-root { box-sizing: border-box; border: 1px solid var(--dsw-alias-border-l2, rgba(128,128,128,0.4)); height: 32px; border-radius: 18px; background: transparent; color: var(--dsw-alias-label-primary, #333); display: inline-flex; justify-content: center; align-items: center; padding: 6px 12px; font-size: 13px; font-weight: 400; line-height: 20px; font-variant-numeric: tabular-nums; overflow: hidden; white-space: nowrap; min-width: 0; max-width: 100%; cursor: pointer; text-decoration: none; }
       .bi-sep { color: var(--dsw-alias-separator-primary, rgba(128,128,128,0.5)); margin: 0 8px; }
       /* 服务商名等一般强调：加粗 600 */
       .bi-root b { color: var(--dsw-alias-label-primary, #333); font-weight: 600; }
-      /* 数字：加粗 700（余额/倒计时/本对话花费/原生统计数字） */
+      /* 数字：加粗 700（余额/倒计时/本对话花费） */
       .bi-root b.bi-num { font-weight: 700; }
       /* 高峰价：琥珀色 + 加粗；空闲价：绿色 + 加粗 */
       .bi-peak    { color: var(--dsw-alias-state-warn-primary, #d97706); font-weight: 700; }
@@ -137,38 +134,22 @@ module.exports = {
       return function () { disposeStyles(); };
     }, 'dsh-bottom-info-bar: styles');
 
-    // ---------- 注册：一体替换（同 id 'stats'） ----------
+    // ---------- 注册：会话头部右侧工具区（与 Session log 同槽） ----------
     let density = 'full';
-    let toggling = false; // 防抖：rpc 异步期间禁止重复切换（只允许 full/compact 两态）
     let injectReady = false;
     let occupantDispose = null;
 
     function applyMode() {
       if (occupantDispose) { occupantDispose(); occupantDispose = null; }
       occupantDispose = slots.register(
-        // 静态注册无动态沙箱的优先级自动分配：显式给低 priority（最低者渲染）以遮蔽原生 stats 栏（priority 0）
-        { name: 'conversation.composer.dock', id: 'stats', priority: -1000 },
+        { name: 'conversation.session.header.utilities', id: 'dsh-bottom-info-bar', order: -100 },
         function (slotProps) {
-          return React.createElement(BottomInfoBar, Object.assign({}, slotProps, { density: density, onToggleDensity: onToggleDensity }));
+          return React.createElement(BottomInfoBar, Object.assign({}, slotProps, { density: density }));
         }
       );
     }
 
-    function onToggleDensity() {
-      if (toggling) return; // 切换进行中，忽略连点
-      toggling = true;
-      const next = density === 'full' ? 'compact' : 'full';
-      rpc('setInfoDensity', { density: next }).then(function () {
-        density = next;
-        toggling = false;
-        applyMode();
-      }).catch(function (err) {
-        toggling = false;
-        console.error('Bottom Info Bar 切换信息密度失败', err);
-      });
-    }
-
-    slots.inject('conversation.composer.dock', function () {
+    slots.inject('conversation.session.header.utilities', function () {
       injectReady = true;
       applyMode();
       return function () { if (occupantDispose) occupantDispose(); };
@@ -184,16 +165,14 @@ module.exports = {
 
     // ---------- 组件 ----------
     function BottomInfoBar(props) {
-      // 原生/会话投影（hooks 无条件调用）
-      const statsProj = props.useProjection ? props.useProjection('sessionStats') : undefined;
-      const usageProj = props.useProjection ? props.useProjection('tokenUsage') : undefined;
-
       const [state, setState] = React.useState({
         loading: true, balance: null, pricing: null, usage: null, billingMode: null, sub: null,
         errors: { balance: null, pricing: null, usage: null, billingMode: null, sub: null },
       });
       const [updateInfo, setUpdateInfo] = React.useState(null);
        const [now, setNow] = React.useState(Date.now());
+      // 价格面板开关（由 dsh-ui-tweaks 设置页「界面调整 → 功能」控制）
+      const [enabled, setEnabled] = React.useState(true);
 
       // 当前会话 ID 多路获取：slotProps 标准 kit → session 快照 → 运行时 sessions 服务
       // （DSH 各版本注入方式不同，任一路可用即拿到真实会话 ID，避免回退到上一会话的账）
@@ -267,45 +246,35 @@ module.exports = {
         return function () { window.clearInterval(id); };
       }, [load]);
 
-      // 会话统计变化（回复中 turns/steps/tokens 增长，回复完成时停止）→ 防抖后即时刷新花费，
-      // 不等下一个 30s 轮询：用户回复一结束即可看到真实金额
-      React.useEffect(function () {
-        if (!statsProj) return undefined;
-        const timer = window.setTimeout(load, 800);
-        return function () { window.clearTimeout(timer); };
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-      }, [load,
-        statsProj && statsProj.turns,
-        statsProj && statsProj.steps,
-        statsProj && statsProj.decodeTokens,
-      ]);
-
       React.useEffect(function () {
         const id = window.setInterval(function () { setNow(Date.now()); }, 1000);
         return function () { window.clearInterval(id); };
       }, []);
 
-      // ---- 与原生一致格式工具 ----
-      function formatTokens(n) {
-        const scaled = function (v) { return v >= 100 ? String(Math.round(v)) : String(Math.round(v * 10) / 10); };
-        if (n < 1e3) return String(n);
-        if (n < 1e6) return scaled(n / 1e3) + 'K';
-        return scaled(n / 1e6) + 'M';
-      }
-      function formatDuration(ms) {
-        const s = ms / 1e3;
-        if (s < 60) return Math.round(s * 10) / 10 + 's';
-        const whole = Math.round(s);
-        const sec = whole % 60;
-        return Math.floor(whole / 60) + 'm' + String(sec).padStart(2, '0') + 's';
-      }
-      function formatTps(tps) {
-        const clamped = Math.max(0, tps);
-        return clamped >= 10 ? String(Math.round(clamped)) : String(Math.round(clamped * 10) / 10);
-      }
-      function billedInput(usage) {
-        return (usage.uncachedInputTokens || 0) + (usage.cacheReadTokens || 0) + (usage.cacheWriteTokens || 0);
-      }
+      // 初次读取开关状态（dsh-ui-tweaks 配置），随后监听切换事件即时更新
+      React.useEffect(function () {
+        let active = true;
+        fetch('/_dsh/dsh-ui-tweaks/getConfig', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: '{}',
+        }).then(function (res) {
+          return res.ok ? res.json() : null;
+        }).then(function (cfg) {
+          if (active && cfg && cfg.value && typeof cfg.value.bottomInfoBarEnabled === 'boolean') {
+            setEnabled(cfg.value.bottomInfoBarEnabled);
+          }
+        }).catch(function () { /* 读取失败保持默认开启 */ });
+        function onVisibility(e) {
+          setEnabled(!(e && e.detail && e.detail.enabled === false));
+        }
+        window.addEventListener('dsh-bottom-info-bar:visibility', onVisibility);
+        return function () {
+          active = false;
+          window.removeEventListener('dsh-bottom-info-bar:visibility', onVisibility);
+        };
+      }, []);
+
       function fmt(n, digits) {
         if (n == null || isNaN(n)) return '—';
         return n.toFixed(digits == null ? 2 : digits);
@@ -354,29 +323,6 @@ module.exports = {
         return React.createElement('b', { className: 'bi-num' }, String(t));
       }
 
-      // 服务商 + 具体模型（两种模式共用；纯显示，不拦截点击——点击冒泡到整条信息栏触发密度切换；hover 展示定价模式）
-      // M5：模型名/服务商名均取 DSH 目录名（与模型切换器完全一致）；当服务商名已是模型名前缀
-      // （如 "DeepSeek" + "DeepSeek-V4-Flash"）→ 只显示模型名（切换器样式，避免 "DeepSeek · DeepSeek-V4-Flash" 重复）
-      function providerGroup() {
-        const pr = state.pricing;
-        const provLabel = (pr && pr.providerDisplay) ? pr.providerDisplay : '未知';
-        const modelLabel = (pr && pr.modelDisplay) ? pr.modelDisplay
-          : (pr && pr.model ? pr.model : '未知模型');
-        const redundant = provLabel.length > 1 && modelLabel.toLowerCase().indexOf(provLabel.toLowerCase()) === 0;
-        const provTitle = '服务商：' + provLabel + ' ' + modelLabel + '\n'
-          + (pr && pr.mode === 'peak-valley' ? '定价：峰谷价（高峰 9-12、14-18 点）'
-            : (pr && pr.mode === 'flat' ? '定价：固定价' : '定价：未收录，按默认计'));
-        if (redundant) {
-          return React.createElement('span', { key: 'prov', title: provTitle },
-            React.createElement('b', null, modelLabel));
-        }
-        return React.createElement('span', { key: 'prov', title: provTitle },
-          React.createElement('b', null, provLabel),
-          ' ',
-          modelLabel,
-        );
-      }
-
       // 订阅服务名（订阅制模式下"服务商"指订阅服务本身，不是模型厂商）
       // Codex 与 ChatGPT 已合并：实际 provider openai-codex / chatgpt 均显示 ChatGPT；codex 保持 Codex
       function subscriptionServiceName(provider) {
@@ -386,26 +332,11 @@ module.exports = {
         return '订阅';
       }
 
-      // 订阅制模型组：订阅服务名 · 具体模型（如 `OpenCode Go · V4 Flash`、`Codex · GPT 5 Codex`）
-      function subscriptionProviderGroup() {
-        const pr = state.pricing;
-        const serviceName = subscriptionServiceName(state.billingMode && state.billingMode.provider);
-        const modelLabel = (pr && pr.modelDisplay) ? pr.modelDisplay
-          : (pr && pr.model ? pr.model : '未知模型');
-        const title = '订阅服务：' + serviceName + '\n模型：' + modelLabel;
-        return React.createElement('span', { key: 'subprov', title: title },
-          React.createElement('b', null, serviceName),
-          ' · ',
-          modelLabel,
-        );
-      }
-
-      // ---- 余额制模式（v1.0.0 现状，完全不动）：服务商+模型 → 余额 → 时段 → 倒计时 → 本对话花费 ----
+      // ---- 余额制模式：余额 → 时段 → 倒计时 → 本对话花费 ----
       function pushBalanceGroups(groups) {
         const bal = state.balance;
         const errors = state.errors || {};
         const alertActive = !!(bal && bal.alert && bal.alert.active);
-        groups.push(providerGroup());
 
         // 余额（纯金额；hover 仅展示余额，不显示充值/赠金）
         if (bal && bal.error && bal.error.kind === 'no-key') {
@@ -478,8 +409,8 @@ module.exports = {
         }
       }
 
-      // ---- 订阅制模式（互斥替换余额制版，row2 只三类信息）：
-      //      订阅服务+模型 → 三窗口额度 → 距重置倒计时（最紧窗口）；余额/时段/花费/token 均不显示 ----
+      // ---- 订阅制模式（互斥替换余额制版）：
+      //      订阅服务 → 三窗口额度 → 距重置倒计时（最紧窗口）；余额/时段/花费/token 均不显示 ----
       function subscriptionFailureHint(error, source) {
          const kind = error && error.kind;
          const serviceName = source === 'opencode-go' ? 'OpenCode Go' : 'ChatGPT';
@@ -496,7 +427,6 @@ module.exports = {
        }
 
        function pushSubscriptionGroups(groups) {
-        groups.push(subscriptionProviderGroup());
         const sub = state.sub;
         const errors = state.errors || {};
         if (!sub) {
@@ -576,10 +506,13 @@ module.exports = {
         }
       }
 
+      // 开关关闭时不渲染（价格面板隐藏）
+      if (!enabled) return null;
+
       const groups = [];
-      // 两态严格判定：density 只能是 'full' 或 'compact'（host 校验 + 本地防抖保证）
+      // 两态判定：density 只能是 'full' 或 'compact'（host 校验）
       const full = props.density === 'full';
-      // 模式互斥：订阅制渲染订阅版 row2，余额制渲染 v1.0.0 现状，绝不叠加
+      // 模式互斥：订阅制渲染订阅版，余额制渲染余额版，绝不叠加
       const isSub = !!(state.billingMode && state.billingMode.mode === 'subscription');
       // 逐接口容错渲染：loading 仅"首帧且无任何数据"时占位；此后始终渲染（旧数据 + 失败降级标记），
       // 绝不整栏"加载失败"；rpc 有 20s 超时兜底，也不存在永久"加载中…"
@@ -613,67 +546,39 @@ module.exports = {
          }, '新版本提醒'));
        }
 
-       // ---- 组装 ----
-      const sepNodes = [];
+       // ---- 组装（单行胶囊） ----
       const nodes = [];
       for (let i = 0; i < groups.length; i++) {
         if (i > 0) nodes.push(React.createElement('span', { key: 'sep' + i, className: 'bi-sep' }, '|'));
         nodes.push(React.createElement('span', { key: 'g' + i }, groups[i]));
       }
-      const row2 = React.createElement('div', { className: 'bi-row2' }, ...nodes);
 
-      let row1 = null;
-      if (full && statsProj) {
-        // 每组：{ nodes: React 节点数组（数字用 num 加粗）, text: 纯文本（title 用） }
-        const ng = [];
-        function group(parts, hidden) {
-          const nodesArr = [];
-          const texts = [];
-          for (let i = 0; i < parts.length; i++) {
-            const p = parts[i];
-            if (typeof p === 'string') { nodesArr.push(p); texts.push(p); }
-            else { nodesArr.push(p); texts.push(p.props.children); }
-          }
-          ng.push({ nodes: nodesArr, text: texts.join(''), hidden: !!hidden });
+      // 点击跳转充值页：桌面端（Tauri）只走 Rust 命令 → 系统默认浏览器打开，绝不在应用内打开；
+      // 普通浏览器环境回退 window.open 新标签页，弹窗被拦截再回退当前页跳转。
+      function openTopUp(e) {
+        e.preventDefault();
+        const url = 'https://platform.deepseek.com/top_up';
+        const internals = window.__TAURI_INTERNALS__;
+        if (internals && typeof internals.invoke === 'function') {
+          Promise.resolve(internals.invoke('open_external_url', { url: url }))
+            .catch(function (err) {
+              console.warn('[dsh-bottom-info-bar] 打开系统浏览器失败', err);
+            });
+          return;
         }
-
-        group([num(statsProj.turns), ' 轮 · ', num(statsProj.steps), ' 步']);
-
-        const durations = [];
-        if (statsProj.llmMs > 0) durations.push('LLM ', num(formatDuration(statsProj.llmMs)));
-        if (statsProj.toolMs > 0) durations.push(' · 工具调用 ', num(formatDuration(statsProj.toolMs)));
-        if (durations.length > 0) group(durations);
-
-        const speeds = [];
-        if (statsProj.ttftSteps > 0) speeds.push('首 token 平均 ', num(formatDuration(statsProj.ttftMs / statsProj.ttftSteps)));
-        if (statsProj.decodeMs > 0) speeds.push(' · ', num(formatTps(statsProj.decodeTokens / (statsProj.decodeMs / 1e3))), ' tok/s');
-        if (speeds.length > 0) group(speeds, HIDE_SPEED_FIELDS); // 不占可见版式，title 浮窗保留
-
-        if (usageProj && (billedInput(usageProj) > 0 || (usageProj.outputTokens || 0) > 0)) {
-          const denom = billedInput(usageProj);
-          const hit = denom > 0 ? Math.round(((usageProj.cacheReadTokens || 0) / denom) * 100) : null;
-          if (hit != null) group(['缓存命中 ', num(hit), '%']);
-          group(['输入 ', num(formatTokens(billedInput(usageProj))), ' tok · 输出 ', num(formatTokens(usageProj.outputTokens || 0)), ' tok']);
-        }
-
-        const nativeLine = ng.map(function (g) { return g.text; }).join(' | ');
-        const ngNodes = [];
-        let visCount = 0;
-        for (let i = 0; i < ng.length; i++) {
-          if (ng[i].hidden) continue; // 隐藏分组不占版式（title 仍含其文本）
-          if (visCount > 0) ngNodes.push(React.createElement('span', { key: 'nsep' + i, className: 'bi-sep' }, '|'));
-          visCount++;
-          ngNodes.push(React.createElement('span', { key: 'ng' + i }, ng[i].nodes));
-        }
-        row1 = React.createElement('div', { className: 'bi-native-row', title: nativeLine }, ...ngNodes);
+        const w = window.open(url, '_blank');
+        if (w === null) window.location.href = url;
       }
 
       const rootCls = 'bi-root';
-      return React.createElement('div', {
+      return React.createElement('a', {
         className: rootCls,
-        onClick: function () { props.onToggleDensity(); },
-        title: '单击切换 完整/简洁',
-      }, row1, row2);
+        href: 'https://platform.deepseek.com/top_up',
+        target: '_blank',
+        rel: 'noopener noreferrer',
+        title: '前往 DeepSeek 平台充值',
+        onClick: openTopUp,
+      }, ...nodes);
     }
   },
 };

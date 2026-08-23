@@ -44,6 +44,17 @@ fn init_state(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         tasks: tokio::sync::Mutex::new(Vec::new()),
     });
     app.manage(shared.clone());
+    // 放行远程 DSH 页面（http://127.0.0.1:*，sidecar 动态端口）调用 open_external_url，
+    // 使价格面板点击能用系统默认浏览器打开充值页（Tauri 默认拒绝远程 origin 的 IPC）。
+    if let Err(e) = app.add_capability(
+        tauri::ipc::CapabilityBuilder::new("dscoder-open-external-url")
+            .window("main")
+            .remote("http://127.0.0.1:*".to_string())
+            .remote("http://localhost:*".to_string())
+            .permission("allow-open-external-url"),
+    ) {
+        eprintln!("[dscoder] add_capability(open_external_url) failed: {e}");
+    }
     // 先供给（运行时 + 插件），完成后再拉起 sidecar 监督器。
     let handle = app.handle().clone();
     let st = shared.clone();
@@ -69,9 +80,30 @@ fn shutdown(app: &AppHandle) {
     });
 }
 
+/// 用系统默认浏览器打开外部链接（价格面板点击跳转充值页等）。
+/// 仅放行 http/https，避免被随意调用；WebView2 里 window.open/_blank
+/// 不可靠，外部链接统一交给本命令走系统浏览器。
+#[tauri::command]
+fn open_external_url(url: String) -> Result<(), String> {
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err("only http/https URLs are allowed".to_string());
+    }
+    let result = if cfg!(target_os = "windows") {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", &url])
+            .spawn()
+    } else if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg(&url).spawn()
+    } else {
+        std::process::Command::new("xdg-open").arg(&url).spawn()
+    };
+    result.map(|_| ()).map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![open_external_url])
         .setup(init_state)
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

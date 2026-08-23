@@ -1,7 +1,8 @@
 'use strict';
 
 // dsh-ui-tweaks — client half（静态 bundle 形态）
-// - 设置页面「界面调整」分区：文本与表格 / 布局 / 功能（仅时间线）
+// - 设置页面「界面调整」分区：文本与表格 / 布局 / 功能（时间线 + 价格面板）
+// - 文本调节快捷键：Ctrl + = / Ctrl + - 全局热键（可在设置中录制改绑）
 // - 对话时间线导航轨（session 槽 conversation.input.dock）
 // - host.call 经 fetch 走 /_dsh/dsh-ui-tweaks/<method>（JSON）
 // - React 由 bundle 的 require('react') / require('react-dom') 提供（seed 模块）
@@ -25,12 +26,24 @@ const MAX_LINE_HEIGHT = 64;
 const DEFAULT_DIALOG_WIDTH = 748;
 const MIN_DIALOG_WIDTH = 600;
 const MAX_DIALOG_WIDTH = 1600;
+const DEFAULT_UI_OPACITY = 100;
+const MIN_UI_OPACITY = 50;
+const MAX_UI_OPACITY = 100;
 const DEFAULT_CODE_FONT_SCALE = 81;
+
+// ---------- 文本调节快捷键（与 host 校验规则保持一致） ----------
+const DEFAULT_ZOOM_IN_SHORTCUT = ['Control', '='];
+const DEFAULT_ZOOM_OUT_SHORTCUT = ['Control', '-'];
+const SHORTCUT_MODIFIERS = ['Control', 'Shift', 'Alt', 'Meta'];
+const SHORTCUT_MODIFIER_LABELS = { Control: 'Ctrl', Shift: 'Shift', Alt: 'Alt', Meta: 'Win' };
+const SHORTCUT_MAX_KEYS = 3;
+const SHORTCUT_NAMED_KEYS = ['Space', 'Enter', 'Tab', 'Backspace', 'Delete', 'Home', 'End', 'PageUp', 'PageDown', 'Insert', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'];
+const SHORTCUT_SYMBOLS = '`~!@#$%^&*()-_=+[]{};:\'",<.>/?\\|';
 
 const I18N = {
   nav: '界面调整',
   sectionText: '文本与表格',
-  sectionLayout: '布局',
+  sectionLayout: '布局与样式',
   sectionFeatures: '功能',
   fontSize: '消息字体大小',
   fontSizeHint: '取值 10–32，作用于消息正文、标题、表格与代码。',
@@ -42,8 +55,24 @@ const I18N = {
   tableStyleHint: 'Markdown 表格的外观：默认边框，或 Claude Desktop 卡片风格。',
   tableStyleDefault: '默认',
   tableStyleClaude: 'Claude Desktop',
+  shortcut: '文本调节快捷键',
+  shortcutHint: 'Ctrl + = 增大、Ctrl + - 减小：消息字体、行高、代码字号一次各调整 2。点击「修改」录制新组合键：1–3 个键，需包含至少一个修饰键（Ctrl / Shift / Alt / Win），Esc 取消；在输入框与文本域内不触发，避免误触。',
+  shortcutZoomIn: '增大',
+  shortcutZoomOut: '减小',
+  shortcutEdit: '修改',
+  shortcutSave: '保存',
+  shortcutCancel: '取消',
+  shortcutPlaceholder: '请按下快捷键…',
+  shortcutRecording: '按下组合键，Esc 取消 · 需含修饰键，最多三个键',
+  shortcutRecorded: '已录制，点击「保存」生效',
+  shortcutNeedModifier: '需包含至少一个修饰键（Ctrl / Shift / Alt / Win），请重新录制',
+  shortcutTooMany: '最多三个键，多余的修饰键已忽略',
+  shortcutSaveFailed: '保存失败，请重试',
+  shortcutConflict: '与另一个快捷键冲突，请重新录制',
   dialogWidth: '对话框宽度',
   dialogWidthHint: '取值 600–1600px；748 为默认列宽，数字越大越宽。',
+  uiOpacity: '界面透明度',
+  uiOpacityHint: '仅设置界面的不透明度（聊天界面不受影响，方便对照效果），取值 50–100%，100 为不透明；滑块右侧实时显示数值。',
   presetDefault: '默认',
   presetWide: '稍宽',
   presetWideXl: '更宽',
@@ -51,7 +80,9 @@ const I18N = {
   timelineHint: '在消息区右侧显示导航轨：悬停预览、点击跳转；会话较短时自动隐藏。',
   timelineOn: '开启',
   timelineOff: '关闭',
-  defaultAction: '默认',
+  priceBar: '价格面板',
+  priceBarHint: '在会话头部右侧显示余额、峰谷价与花费胶囊；关闭后立即隐藏。',
+  restoreDefault: '恢复默认',
   loading: '加载中…',
   unavailable: '设置暂不可用。',
   railLabel: '对话时间线',
@@ -77,7 +108,85 @@ function resolveValue(value) {
     tableStyle: value?.tableStyle === 'claude' ? 'claude' : 'default',
     dialogWidth: resolveDialogWidth(value?.dialogWidth),
     timelineEnabled: value?.timelineEnabled ?? false,
+    bottomInfoBarEnabled: value?.bottomInfoBarEnabled ?? true,
+    zoomInShortcut: shortcutOf(value?.zoomInShortcut, DEFAULT_ZOOM_IN_SHORTCUT),
+    zoomOutShortcut: shortcutOf(value?.zoomOutShortcut, DEFAULT_ZOOM_OUT_SHORTCUT),
+    uiOpacity: typeof value?.uiOpacity === 'number'
+      ? Math.min(MAX_UI_OPACITY, Math.max(MIN_UI_OPACITY, Math.round(value.uiOpacity)))
+      : DEFAULT_UI_OPACITY,
   };
+}
+
+// ---------- 组合键工具 ----------
+function shortcutOf(raw, fallback) {
+  if (!Array.isArray(raw) || raw.length === 0) return fallback;
+  for (const token of raw) if (typeof token !== 'string') return fallback;
+  return raw;
+}
+
+// 触发键规范化：与 host 的白名单一致；返回 null 表示不支持（静默忽略）
+function normalizeTriggerKey(key) {
+  if (typeof key !== 'string' || key.length === 0) return null;
+  if (key === ' ') return 'Space';
+  if (key.length === 1) {
+    if (/^[a-z]$/i.test(key)) return key.toUpperCase();
+    if (/^[0-9]$/.test(key)) return key;
+    if (SHORTCUT_SYMBOLS.indexOf(key) !== -1) return key;
+    return null;
+  }
+  if (/^F([1-9]|1[0-2])$/.test(key)) return key;
+  if (SHORTCUT_NAMED_KEYS.indexOf(key) !== -1) return key;
+  return null;
+}
+
+function formatCombo(tokens) {
+  if (!Array.isArray(tokens) || tokens.length === 0) return '';
+  const isMac = typeof navigator !== 'undefined' && /Mac/i.test((navigator.platform || '') + (navigator.userAgent || ''));
+  const metaLabel = isMac ? 'Cmd' : 'Win';
+  return tokens.map((token) => {
+    if (token === 'Meta') return metaLabel;
+    return SHORTCUT_MODIFIER_LABELS[token] || token;
+  }).join(' + ');
+}
+
+function sameCombo(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+function comboHasTrigger(tokens) {
+  if (!Array.isArray(tokens)) return false;
+  return tokens.filter((t) => SHORTCUT_MODIFIERS.indexOf(t) === -1).length === 1;
+}
+
+function comboHasModifier(tokens) {
+  if (!Array.isArray(tokens)) return false;
+  return tokens.some((t) => SHORTCUT_MODIFIERS.indexOf(t) !== -1);
+}
+
+function isValidCombo(tokens) {
+  return Array.isArray(tokens) && tokens.length >= 2 && tokens.length <= SHORTCUT_MAX_KEYS
+    && comboHasModifier(tokens) && comboHasTrigger(tokens);
+}
+
+// 当前按键事件 → 规范化组合键（修饰键按固定顺序在前，触发键最后）
+function comboOfEvent(event) {
+  const mods = [];
+  if (event.ctrlKey) mods.push('Control');
+  if (event.shiftKey) mods.push('Shift');
+  if (event.altKey) mods.push('Alt');
+  if (event.metaKey) mods.push('Meta');
+  const trigger = normalizeTriggerKey(event.key);
+  if (trigger === null) return null;
+  return mods.concat([trigger]);
+}
+
+function isEditableTarget(target) {
+  if (!(target instanceof Element)) return false;
+  const tag = target.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
+  return target.isContentEditable === true;
 }
 
 // ---------- 配置读写（same-origin HTTP） ----------
@@ -131,6 +240,13 @@ class SettingsClient {
   async unset(field) {
     const generation = ++this.generation;
     const snapshot = await apiRequest('unsetField', { field });
+    if (generation !== this.generation) return;
+    this.publish({ status: 'ready', writable: snapshot.writable, value: snapshot.value, revision: snapshot.revision });
+  }
+  // 快捷键一次性调整三个字段；主机端按请求到达顺序逐个应用，连按不会互相覆盖
+  async adjust(delta) {
+    const generation = ++this.generation;
+    const snapshot = await apiRequest('adjust', { delta });
     if (generation !== this.generation) return;
     this.publish({ status: 'ready', writable: snapshot.writable, value: snapshot.value, revision: snapshot.revision });
   }
@@ -269,10 +385,117 @@ function runtimeStyleElement() {
   return style;
 }
 
+// ---------- 设置界面透明度 ----------
+// 只把不透明度应用到设置界面所在的浮层（向上定位 overlay/面板），聊天界面不受影响，
+// 方便一边看聊天区一边调节。设置面板未打开时找不到目标，直接跳过。
+function findSettingsLayer(start) {
+  let node = start.parentElement;
+  let fixedFallback = null;
+  let absFallback = null;
+  let guard = 0;
+  while (node !== null && guard++ < 25) {
+    if (typeof node.getAttribute === 'function' && node.getAttribute('role') === 'dialog') return node;
+    const style = getComputedStyle(node);
+    const pos = style.position;
+    if (pos === 'fixed' || pos === 'absolute') {
+      const rect = node.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) {
+        // 优先选择覆盖大块视口的 fixed 层（overlay/面板），小浮层只是候选
+        if (pos === 'fixed' && (rect.height >= window.innerHeight * 0.4 || rect.width >= window.innerWidth * 0.4)) {
+          return node;
+        }
+        if (fixedFallback === null && pos === 'fixed') fixedFallback = node;
+        if (absFallback === null && pos === 'absolute') absFallback = node;
+      }
+    }
+    node = node.parentElement;
+  }
+  return fixedFallback ?? absFallback ?? start;
+}
+
+// 定位结果缓存：面板以 display 隐藏/显示（DOM 复用）时无需重新遍历；
+// 元素断开（面板 DOM 重建）或 GC 后自动失效并重新定位。
+const canWeakRef = typeof WeakRef === 'function';
+let settingsLayerCache = null; // WeakRef<Element> | Element | null
+
+function readSettingsLayerCache() {
+  if (settingsLayerCache === null) return null;
+  const el = canWeakRef ? settingsLayerCache.deref() : settingsLayerCache;
+  if (el === undefined || el === null || !el.isConnected) {
+    settingsLayerCache = null;
+    return null;
+  }
+  return el;
+}
+
+function writeSettingsLayerCache(el) {
+  const prev = readSettingsLayerCache();
+  if (prev !== null && prev !== el) {
+    try { prev.style.opacity = ''; } catch (err) { /* 忽略 */ }
+  }
+  settingsLayerCache = canWeakRef ? new WeakRef(el) : el;
+}
+
+// 无锚点兜底：设置面板刚打开时默认 tab 可能不是「界面调整」（.dut-settings 未挂载）。
+// 事件驱动定位：从“信号来源节点”（新增节点 / 被改属性的元素 / 焦点元素）向上找
+// 其最外层 fixed/absolute 祖先（即浮层壳），配合最小面积阈值过滤小浮层，避免误伤。
+function isSettingsLayerCandidate(el) {
+  const rect = el.getBoundingClientRect();
+  if (rect.width === 0 || rect.height === 0) return false;
+  if (el.childElementCount === 0 && (el.textContent || '').trim().length === 0) return false;
+  const area = rect.width * rect.height;
+  const viewportArea = (window.innerWidth || 1) * (window.innerHeight || 1);
+  return area >= viewportArea * 0.15;
+}
+
+function findOutermostLayer(node) {
+  let best = null;
+  let cur = node;
+  let guard = 0;
+  while (cur !== null && cur !== document.body && cur !== document.documentElement && guard++ < 50) {
+    const style = getComputedStyle(cur);
+    if (style.position === 'fixed' || style.position === 'absolute') {
+      if (isSettingsLayerCandidate(cur)) best = cur;
+    }
+    cur = cur.parentElement;
+  }
+  return best;
+}
+
+function applySettingsOpacity(opacity, sourceNodes) {
+  if (typeof document === 'undefined') return;
+  const targetOpacity = opacity >= 100 ? '' : String(Math.round(opacity) / 100);
+  let layer = readSettingsLayerCache();
+  const root = document.querySelector('.dut-settings');
+  if (root !== null) {
+    // 缓存层失效或不再包含当前设置内容（面板层重建）时，以锚点重新定位（结果最准确）
+    if (layer === null || !layer.contains(root)) {
+      layer = findSettingsLayer(root);
+      if (layer !== null) writeSettingsLayerCache(layer);
+    }
+  }
+  if (layer === null && sourceNodes !== undefined) {
+    // 无锚点且无有效缓存：面板刚打开（默认 tab 不是「界面调整」），从信号来源向上定位浮层；
+    // 之后切到「界面调整」会经锚点重新校准，误定位的层会被自动清除透明度
+    for (const src of sourceNodes) {
+      if (src === null || src.nodeType !== 1) continue;
+      const candidate = findOutermostLayer(src);
+      if (candidate !== null) {
+        layer = candidate;
+        writeSettingsLayerCache(candidate);
+        break;
+      }
+    }
+  }
+  if (layer === null) return; // 设置面板未打开：跳过，等面板出现后再应用
+  if (layer.style.opacity !== targetOpacity) layer.style.opacity = targetOpacity;
+}
+
 const BASE_CSS = `
 .dut-settings{display:grid;gap:8px;max-width:680px;padding:4px 2px 24px;color:var(--dsw-alias-label-primary)}
 .dut-panel{display:grid;gap:0;border:1px solid var(--dsw-alias-border-l1);border-radius:14px;background:var(--dsw-alias-bg-layer-1);box-shadow:var(--dsw-shadow-lv1);overflow:hidden}
-.dut-section-label{font-size:10.5px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--dsw-alias-label-tertiary);padding:9px 16px 4px}
+.dut-section-label{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:10.5px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--dsw-alias-label-tertiary);padding:6px 16px 5px}
+.dut-section-label .dut-restore-btn{text-transform:none;letter-spacing:0;font-weight:600}
 .dut-field{display:grid;gap:6px;padding:7px 16px 10px}
 .dut-field+.dut-field{border-top:1px solid var(--dsw-alias-border-l1)}
 .dut-grid{grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:1px;background:var(--dsw-alias-border-l1)}
@@ -299,13 +522,41 @@ const BASE_CSS = `
 .dut-seg button.dut-seg-active{background:color-mix(in srgb,var(--dsw-alias-state-business-primary) 12%,transparent);color:var(--dsw-alias-state-business-primary);font-weight:600;box-shadow:none}
 .dut-seg button:disabled{opacity:.45;cursor:default}
 .dut-presets{display:inline-flex;flex-wrap:wrap;margin-top:2px}
+.dut-range{display:flex;align-items:center;gap:10px}
+.dut-range input[type="range"]{-webkit-appearance:none;appearance:none;flex:1;min-width:150px;max-width:240px;height:18px;margin:0;background:transparent;cursor:pointer}
+.dut-range input[type="range"]:disabled{opacity:.45;cursor:default}
+.dut-range input[type="range"]::-webkit-slider-runnable-track{height:4px;border-radius:999px;background:color-mix(in srgb,var(--dsw-alias-label-tertiary) 32%,transparent)}
+.dut-range input[type="range"]::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:16px;height:16px;margin-top:-6px;border-radius:50%;background-color:color-mix(in srgb,var(--dsw-alias-label-tertiary) 45%,var(--dsw-alias-bg-layer-1));background-image:radial-gradient(circle,var(--dsw-alias-state-business-primary) 49%,transparent 50%);background-size:9px 9px;background-position:center;background-repeat:no-repeat;border:1px solid var(--dsw-alias-border-l1);box-shadow:0 1px 3px rgba(0,0,0,.18);cursor:pointer;transition:background-size .16s ease,border-color .15s ease,box-shadow .15s ease}
+.dut-range input[type="range"]::-webkit-slider-thumb:hover{background-size:13px 13px;border-color:var(--dsw-alias-state-business-primary)}
+.dut-range input[type="range"]:focus-visible{outline:none}
+.dut-range input[type="range"]:focus-visible::-webkit-slider-thumb{border-color:var(--dsw-alias-state-business-primary);box-shadow:0 0 0 3px color-mix(in srgb,var(--dsw-alias-state-business-primary) 25%,transparent)}
+.dut-range input[type="range"]::-moz-range-track{height:4px;border-radius:999px;background:color-mix(in srgb,var(--dsw-alias-label-tertiary) 32%,transparent)}
+.dut-range input[type="range"]::-moz-range-thumb{width:16px;height:16px;border-radius:50%;background-color:color-mix(in srgb,var(--dsw-alias-label-tertiary) 45%,var(--dsw-alias-bg-layer-1));background-image:radial-gradient(circle,var(--dsw-alias-state-business-primary) 49%,transparent 50%);background-size:9px 9px;background-position:center;background-repeat:no-repeat;border:1px solid var(--dsw-alias-border-l1);box-shadow:0 1px 3px rgba(0,0,0,.18);cursor:pointer;transition:background-size .16s ease,border-color .15s ease}
+.dut-range input[type="range"]::-moz-range-thumb:hover{background-size:13px 13px;border-color:var(--dsw-alias-state-business-primary)}
+.dut-range-value{min-width:38px;text-align:right;font-size:13px;font-weight:600;font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-primary)}
 .dut-btn{display:inline-flex;align-items:center;height:26px;padding:0 12px;border-radius:999px;border:1px solid var(--dsw-alias-border-l1);background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:11.5px;cursor:pointer;transition:background .15s ease,color .15s ease,border-color .15s ease}
 .dut-btn:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
 .dut-btn.dut-btn-active{background:color-mix(in srgb,var(--dsw-alias-state-business-primary) 12%,transparent);border-color:color-mix(in srgb,var(--dsw-alias-state-business-primary) 45%,transparent);color:var(--dsw-alias-state-business-primary)}
 .dut-btn:disabled{opacity:.4;cursor:default}
+.dut-restore-btn{flex:none}
+.dut-restore-btn:active:not(:disabled){background:color-mix(in srgb,var(--dsw-alias-state-business-primary) 14%,transparent);border-color:color-mix(in srgb,var(--dsw-alias-state-business-primary) 50%,transparent);color:var(--dsw-alias-state-business-primary)}
 .dut-loading{padding:16px;border-radius:12px;background:var(--dsw-alias-bg-layer-2);font-size:12px;color:var(--dsw-alias-label-secondary)}
 .dut-alert{padding:10px 12px;border-radius:10px;font-size:12px;line-height:1.5}
 .dut-alert.error{background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 10%,transparent);color:var(--dsw-alias-state-error-primary)}
+.dut-shortcut-item{display:grid;gap:3px}
+.dut-shortcut-rows{display:grid;gap:9px;margin-top:2px}
+.dut-shortcut-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.dut-shortcut-tag{flex:none;min-width:34px;font-size:12px;font-weight:600;color:var(--dsw-alias-label-secondary)}
+.dut-shortcut-key{box-sizing:border-box;flex:1 1 150px;min-width:140px;max-width:250px;height:28px;padding:0 10px;border:1px solid var(--dsw-alias-border-l1);border-radius:9px;background:var(--dsw-alias-bg-layer-2);color:inherit;font:inherit;font-size:12.5px;text-align:center;letter-spacing:.02em;outline:none;transition:border-color .15s ease,box-shadow .15s ease,background-color .15s ease}
+.dut-shortcut-key::placeholder{color:var(--dsw-alias-label-tertiary)}
+.dut-shortcut-key:focus{border-color:var(--dsw-alias-state-business-primary)}
+.dut-shortcut-key:disabled{opacity:.45;cursor:default}
+.dut-shortcut-key-recording{border-color:var(--dsw-alias-state-business-primary);background:color-mix(in srgb,var(--dsw-alias-state-business-primary) 8%,var(--dsw-alias-bg-layer-2));color:var(--dsw-alias-state-business-primary);box-shadow:0 0 0 2px color-mix(in srgb,var(--dsw-alias-state-business-primary) 16%,transparent);animation:dut-key-pulse 1.6s ease-in-out infinite}
+.dut-shortcut-key-recording::placeholder{color:var(--dsw-alias-state-business-primary)}
+@keyframes dut-key-pulse{0%,100%{box-shadow:0 0 0 2px color-mix(in srgb,var(--dsw-alias-state-business-primary) 14%,transparent)}50%{box-shadow:0 0 0 3px color-mix(in srgb,var(--dsw-alias-state-business-primary) 34%,transparent)}}
+@media (prefers-reduced-motion:reduce){.dut-shortcut-key-recording{animation:none}}
+.dut-shortcut-status{font-size:11px;line-height:1.4;color:var(--dsw-alias-label-tertiary);min-height:15px;padding:0 2px}
+.dut-shortcut-status-warn{color:var(--dsw-alias-state-error-primary)}
 `;
 
 function installBaseStyles() {
@@ -363,6 +614,15 @@ function Field(props) {
   );
 }
 
+// 分区标题行：左侧分区名，最右侧放置该分区统一的「恢复默认」按钮
+function SectionLabel(props) {
+  const { title, onRestore } = props;
+  return React.createElement('div', { className: 'dut-section-label' },
+    React.createElement('span', null, title),
+    onRestore ? React.createElement(RestoreBtn, { onClick: onRestore }) : null,
+  );
+}
+
 function Stepper(props) {
   const { value, draft, min, max, step, disabled, onStep, onChange, onCommit } = props;
   return React.createElement('div', { className: 'dut-stepper' },
@@ -388,13 +648,204 @@ function Seg(props) {
   );
 }
 
-function ResetBtn(props) {
-  const { active, disabled, onClick } = props;
+// 界面透明度：音量条（滑块）形式，右侧实时显示数值（百分比）
+function OpacityControl(props) {
+  const { value, disabled, onCommit } = props;
+  return React.createElement('div', { className: 'dut-range' },
+    React.createElement('input', {
+      type: 'range', min: MIN_UI_OPACITY, max: MAX_UI_OPACITY, step: 1,
+      value, disabled,
+      'aria-label': I18N.uiOpacity,
+      onChange: (event) => { onCommit(Number(event.target.value)); },
+    }),
+    React.createElement('span', { className: 'dut-range-value' }, value + '%'),
+  );
+}
+
+// 恢复默认按钮：位于每个 label 行的最右侧；按下即高亮（:active），松开鼠标时触发恢复并取消高亮
+function RestoreBtn(props) {
+  const { disabled, onClick } = props;
   return React.createElement('button', {
     type: 'button', disabled,
-    className: 'dut-btn' + (active ? ' dut-btn-active' : ''),
+    className: 'dut-btn dut-restore-btn',
+    onMouseDown: (event) => { event.preventDefault(); }, // 保持输入框焦点，避免 blur 提交竞态
     onClick,
-  }, I18N.defaultAction);
+  }, I18N.restoreDefault);
+}
+
+// ---------- 文本调节快捷键：全局热键 + 录制组件 ----------
+const activeRecorders = new Set();
+let recorderSeq = 0;
+
+function installHotkeys(controller) {
+  const onKeyDown = (event) => {
+    if (activeRecorders.size > 0) return;            // 录制中：按键交给录制输入框
+    if (isEditableTarget(event.target)) return;       // 输入框/文本域内不触发，避免误触
+    const state = controller.getSnapshot();
+    if (state.status !== 'ready' || !state.value) return;
+    const combo = comboOfEvent(event);
+    if (combo === null) return;
+    const zoomIn = shortcutOf(state.value.zoomInShortcut, DEFAULT_ZOOM_IN_SHORTCUT);
+    const zoomOut = shortcutOf(state.value.zoomOutShortcut, DEFAULT_ZOOM_OUT_SHORTCUT);
+    const isIn = sameCombo(combo, zoomIn);
+    if (!isIn && !sameCombo(combo, zoomOut)) return;
+    event.preventDefault();                           // 拦截浏览器/宿主自身的 Ctrl+= / Ctrl+- 缩放
+    event.stopPropagation();
+    if (event.repeat) return;                         // 长按不连发：一次按键只调整一步
+    void controller.adjust(isIn ? 2 : -2).catch(() => {});
+  };
+  window.addEventListener('keydown', onKeyDown, { capture: true });
+  return () => { window.removeEventListener('keydown', onKeyDown, { capture: true }); };
+}
+
+function ShortcutRow(props) {
+  const { tag, field, savedValue, disabled, controller } = props;
+  const recorderIdRef = React.useRef(null);
+  if (recorderIdRef.current === null) recorderIdRef.current = ++recorderSeq;
+  const recorderId = recorderIdRef.current;
+
+  const inputRef = React.useRef(null);
+  const heldModsRef = React.useRef([]);
+  const [mode, setMode] = React.useState('idle'); // idle | recording | done
+  const [combo, setCombo] = React.useState(null);
+  const [heldMods, setHeldMods] = React.useState([]);
+  const [note, setNote] = React.useState(null);
+
+  const stop = React.useCallback(() => {
+    activeRecorders.delete(recorderId);
+    heldModsRef.current = [];
+    setMode('idle');
+    setCombo(null);
+    setHeldMods([]);
+    setNote(null);
+  }, [recorderId]);
+  const start = React.useCallback(() => {
+    activeRecorders.add(recorderId);
+    heldModsRef.current = [];
+    setMode('recording');
+    setCombo(null);
+    setHeldMods([]);
+    setNote(null);
+  }, [recorderId]);
+
+  // 组件卸载（如离开设置页）时兜底解除录制，避免全局热键被锁死
+  React.useEffect(() => () => { activeRecorders.delete(recorderId); }, [recorderId]);
+
+  const beginCapture = () => {
+    if (disabled) return;
+    start();
+    if (inputRef.current !== null) inputRef.current.focus();
+  };
+
+  const captureKey = (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.key === 'Escape') { stop(); return; }
+    if (SHORTCUT_MODIFIERS.indexOf(event.key) !== -1) {
+      if (heldModsRef.current.indexOf(event.key) === -1) {
+        heldModsRef.current = SHORTCUT_MODIFIERS.filter(
+          (m) => heldModsRef.current.indexOf(m) !== -1 || m === event.key,
+        );
+      }
+      setHeldMods(heldModsRef.current);
+      return;
+    }
+    const trigger = normalizeTriggerKey(event.key);
+    if (trigger === null) return; // 不支持的按键：静默忽略
+    let mods = heldModsRef.current;
+    if (mods.length > SHORTCUT_MAX_KEYS - 1) {
+      mods = mods.slice(0, SHORTCUT_MAX_KEYS - 1);
+      setNote({ kind: 'warn', text: I18N.shortcutTooMany });
+    }
+    heldModsRef.current = [];
+    setHeldMods([]);
+    setCombo(mods.concat([trigger]));
+    setMode('done');
+    if (mods.length === 0) setNote({ kind: 'warn', text: I18N.shortcutNeedModifier });
+  };
+
+  const onKeyDown = (event) => {
+    if (mode === 'recording') { captureKey(event); return; }
+    if (mode === 'done') {
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.key === 'Escape') { stop(); return; }
+      // 录制完成后再按键：视为重新录制，立即处理当前按键
+      heldModsRef.current = [];
+      setHeldMods([]);
+      setCombo(null);
+      setNote(null);
+      setMode('recording');
+      captureKey(event);
+    }
+  };
+
+  const onKeyUp = (event) => {
+    if (mode !== 'recording') return;
+    if (SHORTCUT_MODIFIERS.indexOf(event.key) === -1) return;
+    heldModsRef.current = heldModsRef.current.filter((m) => m !== event.key);
+    setHeldMods(heldModsRef.current);
+  };
+
+  const onBlur = () => { if (mode !== 'idle') stop(); };
+
+  const canSave = mode === 'done' && isValidCombo(combo);
+  const save = () => {
+    if (!isValidCombo(combo)) return;
+    controller.set(field, combo)
+      .then(() => { stop(); })
+      .catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        setNote({
+          kind: 'warn',
+          text: message.indexOf('conflict') !== -1 ? I18N.shortcutConflict : I18N.shortcutSaveFailed,
+        });
+      });
+  };
+
+  let display = formatCombo(savedValue);
+  if (mode === 'recording') display = heldMods.length > 0 ? formatCombo(heldMods) + ' + …' : '';
+  else if (mode === 'done') display = formatCombo(combo);
+  const status = note !== null ? note
+    : mode === 'recording' ? { kind: 'info', text: I18N.shortcutRecording }
+    : mode === 'done' ? { kind: 'info', text: I18N.shortcutRecorded }
+    : null;
+
+  return React.createElement('div', { className: 'dut-shortcut-item' },
+    React.createElement('div', { className: 'dut-shortcut-row' },
+      React.createElement('span', { className: 'dut-shortcut-tag' }, tag),
+      React.createElement('input', {
+        ref: inputRef,
+        className: 'dut-shortcut-key' + (mode !== 'idle' ? ' dut-shortcut-key-recording' : ''),
+        type: 'text',
+        readOnly: true,
+        disabled,
+        value: display,
+        placeholder: I18N.shortcutPlaceholder,
+        'aria-label': tag,
+        onKeyDown,
+        onKeyUp,
+        onBlur,
+      }),
+      mode === 'idle'
+        ? React.createElement('button', { type: 'button', className: 'dut-btn', disabled, onClick: beginCapture }, I18N.shortcutEdit)
+        : React.createElement(React.Fragment, null,
+          React.createElement('button', {
+            type: 'button', className: 'dut-btn dut-btn-active', disabled: !canSave,
+            onMouseDown: (event) => { event.preventDefault(); }, // 防止失焦取消录制
+            onClick: save,
+          }, I18N.shortcutSave),
+          React.createElement('button', {
+            type: 'button', className: 'dut-btn',
+            onMouseDown: (event) => { event.preventDefault(); },
+            onClick: stop,
+          }, I18N.shortcutCancel),
+        ),
+    ),
+    React.createElement('div', {
+      className: 'dut-shortcut-status' + (status !== null && status.kind === 'warn' ? ' dut-shortcut-status-warn' : ''),
+    }, status !== null ? status.text : '\u00A0'),
+  );
 }
 
 function SettingsSection({ controller }) {
@@ -412,6 +863,8 @@ function SettingsSection({ controller }) {
   React.useEffect(() => { setCodeDraft(String(resolved.codeFontSize)); }, [resolved.codeFontSize]);
   React.useEffect(() => { setLineHeightDraft(String(resolved.lineHeight)); }, [resolved.lineHeight]);
   React.useEffect(() => { setWidthDraft(String(resolved.dialogWidth)); }, [resolved.dialogWidth]);
+  // 面板挂载/透明度变化时应用设置界面透明度（宿主重建面板 DOM 后也会重新应用）
+  React.useEffect(() => { applySettingsOpacity(resolved.uiOpacity); }, [resolved.uiOpacity]);
 
   const commitNumber = (field, raw, setter, min, max) => {
     setter(raw);
@@ -425,6 +878,28 @@ function SettingsSection({ controller }) {
     const next = Math.min(max, Math.max(min, current + delta));
     setter(String(next));
     void controller.set(field, next).catch(() => {});
+  };
+  const togglePriceBar = (next) => {
+    void controller.set('bottomInfoBarEnabled', next).catch(() => {});
+    window.dispatchEvent(new CustomEvent('dsh-bottom-info-bar:visibility', { detail: { enabled: next } }));
+  };
+  // 各分区统一的「恢复默认」：恢复该分区下全部字段的默认值
+  const restoreTextSection = () => {
+    void controller.unset('fontSize').catch(() => {});
+    void controller.unset('lineHeight').catch(() => {});
+    void controller.unset('codeFontSize').catch(() => {});
+    void controller.unset('zoomOutShortcut').catch(() => {});
+    void controller.unset('zoomInShortcut').catch(() => {});
+    void controller.unset('tableStyle').catch(() => {});
+  };
+  const restoreLayoutSection = () => {
+    void controller.unset('dialogWidth').catch(() => {});
+    void controller.unset('uiOpacity').catch(() => {});
+  };
+  const restoreFeaturesSection = () => {
+    void controller.unset('timelineEnabled').catch(() => {});
+    void controller.unset('bottomInfoBarEnabled').catch(() => {});
+    window.dispatchEvent(new CustomEvent('dsh-bottom-info-bar:visibility', { detail: { enabled: true } }));
   };
 
   if (state.status === 'loading' && state.value === undefined) {
@@ -440,7 +915,7 @@ function SettingsSection({ controller }) {
 
     // 文本与表格
     React.createElement('section', { className: 'dut-panel' },
-      React.createElement('div', { className: 'dut-section-label' }, I18N.sectionText),
+      React.createElement(SectionLabel, { title: I18N.sectionText, onRestore: restoreTextSection }),
 
       React.createElement(Field, { label: I18N.fontSize, hint: I18N.fontSizeHint },
         React.createElement(Stepper, {
@@ -448,10 +923,6 @@ function SettingsSection({ controller }) {
           onStep: (d) => { step('fontSize', resolved.fontSize, setDraft, MIN_FONT_SIZE, MAX_FONT_SIZE, d); },
           onChange: setDraft,
           onCommit: (v) => { commitNumber('fontSize', v, setDraft, MIN_FONT_SIZE, MAX_FONT_SIZE); },
-        }),
-        React.createElement(ResetBtn, {
-          active: resolved.fontSize === DEFAULT_FONT_SIZE, disabled: !writable,
-          onClick: () => { void controller.unset('fontSize').catch(() => {}); },
         }),
       ),
 
@@ -462,10 +933,6 @@ function SettingsSection({ controller }) {
           onChange: setLineHeightDraft,
           onCommit: (v) => { commitNumber('lineHeight', v, setLineHeightDraft, MIN_LINE_HEIGHT, MAX_LINE_HEIGHT); },
         }),
-        React.createElement(ResetBtn, {
-          active: resolved.lineHeight === DEFAULT_LINE_HEIGHT, disabled: !writable,
-          onClick: () => { void controller.unset('lineHeight').catch(() => {}); },
-        }),
       ),
 
       React.createElement(Field, { label: I18N.codeFontSize, hint: I18N.codeFontSizeHint },
@@ -475,10 +942,22 @@ function SettingsSection({ controller }) {
           onChange: setCodeDraft,
           onCommit: (v) => { commitNumber('codeFontSize', v, setCodeDraft, MIN_CODE_FONT_SIZE, MAX_CODE_FONT_SIZE); },
         }),
-        React.createElement(ResetBtn, {
-          active: resolved.codeFontSize === DEFAULT_CODE_FONT_SIZE, disabled: !writable,
-          onClick: () => { void controller.unset('codeFontSize').catch(() => {}); },
-        }),
+      ),
+
+      React.createElement(Field, { label: I18N.shortcut, hint: I18N.shortcutHint },
+        null,
+        React.createElement('div', { className: 'dut-shortcut-rows' },
+          React.createElement(ShortcutRow, {
+            tag: I18N.shortcutZoomIn, field: 'zoomInShortcut',
+            savedValue: resolved.zoomInShortcut,
+            disabled: !writable, controller,
+          }),
+          React.createElement(ShortcutRow, {
+            tag: I18N.shortcutZoomOut, field: 'zoomOutShortcut',
+            savedValue: resolved.zoomOutShortcut,
+            disabled: !writable, controller,
+          }),
+        ),
       ),
 
       React.createElement(Field, { label: I18N.tableStyle, hint: I18N.tableStyleHint },
@@ -494,7 +973,7 @@ function SettingsSection({ controller }) {
 
     // 布局
     React.createElement('section', { className: 'dut-panel' },
-      React.createElement('div', { className: 'dut-section-label' }, I18N.sectionLayout),
+      React.createElement(SectionLabel, { title: I18N.sectionLayout, onRestore: restoreLayoutSection }),
 
       React.createElement(Field, {
         label: I18N.dialogWidth, hint: I18N.dialogWidthHint,
@@ -516,11 +995,18 @@ function SettingsSection({ controller }) {
           onCommit: (v) => { commitNumber('dialogWidth', v, setWidthDraft, MIN_DIALOG_WIDTH, MAX_DIALOG_WIDTH); },
         }),
       ),
+
+      React.createElement(Field, { label: I18N.uiOpacity, hint: I18N.uiOpacityHint },
+        React.createElement(OpacityControl, {
+          value: resolved.uiOpacity, disabled: !writable,
+          onCommit: (v) => { void controller.set('uiOpacity', v).catch(() => {}); },
+        }),
+      ),
     ),
 
-    // 功能（仅时间线）
+    // 功能（时间线 + 价格面板开关）
     React.createElement('section', { className: 'dut-panel dut-grid' },
-      React.createElement('div', { className: 'dut-section-label' }, I18N.sectionFeatures),
+      React.createElement(SectionLabel, { title: I18N.sectionFeatures, onRestore: restoreFeaturesSection }),
 
       React.createElement(Field, { label: I18N.timeline, hint: I18N.timelineHint },
         React.createElement(Seg, {
@@ -528,6 +1014,16 @@ function SettingsSection({ controller }) {
           options: [
             { value: true, label: I18N.timelineOn, onClick: () => { void controller.set('timelineEnabled', true).catch(() => {}); } },
             { value: false, label: I18N.timelineOff, onClick: () => { void controller.set('timelineEnabled', false).catch(() => {}); } },
+          ],
+        }),
+      ),
+
+      React.createElement(Field, { label: I18N.priceBar, hint: I18N.priceBarHint },
+        React.createElement(Seg, {
+          value: resolved.bottomInfoBarEnabled, disabled: !writable,
+          options: [
+            { value: true, label: I18N.timelineOn, onClick: () => { togglePriceBar(true); } },
+            { value: false, label: I18N.timelineOff, onClick: () => { togglePriceBar(false); } },
           ],
         }),
       ),
@@ -907,7 +1403,9 @@ module.exports = {
       const applyCss = () => {
         const state = controller.getSnapshot();
         if (state.status === 'ready') {
-          runtimeStyleElement().textContent = buildRuntimeCss(resolveValue(state.value));
+          const value = resolveValue(state.value);
+          runtimeStyleElement().textContent = buildRuntimeCss(value);
+          applySettingsOpacity(value.uiOpacity);
         }
       };
       applyCss();
@@ -915,6 +1413,118 @@ module.exports = {
       void controller.load();
       return dispose;
     }, 'dsh-ui-tweaks: runtime css');
+
+    // 文本调节快捷键（默认 Ctrl + = / Ctrl + -，可在设置「文本与表格」中改绑）
+    ctx.effect(() => installHotkeys(controller), 'dsh-ui-tweaks: hotkeys');
+
+    // 事件驱动的全局信号：设置面板打开必然伴随“DOM 插入 / 属性变化 / 焦点移入 / 点击”之一，
+    // 任一信号触发即探测并应用透明度（rAF 节流 + 冷却延后，不丢弃面板打开信号），无需轮询、零空转。
+    // 解决“重启后第一次点开设置（默认 tab 不是「界面调整」）不生效”的问题。
+    ctx.effect(() => {
+      if (typeof document === 'undefined' || document.body === null) {
+        return () => {};
+      }
+      let raf = 0;
+      let sources = [];            // 信号来源节点：新增节点 + 被改属性的元素 + 焦点元素
+      let pendingAfterCooldown = []; // 冷却期内的信号：延后处理，绝不丢弃
+      let cooldownTimer = 0;
+      let clickTimer = 0;
+      let settleTimer = 0;
+      let lastProbeAt = 0;
+
+      const apply = (batch) => {
+        const state = controller.getSnapshot();
+        if (state.status === 'ready') applySettingsOpacity(resolveValue(state.value).uiOpacity, batch);
+      };
+
+      const runProbe = (batch) => {
+        lastProbeAt = Date.now() + 200;
+        const layerBefore = readSettingsLayerCache();
+        apply(batch);
+        // 有信号但尚未定位成功：面板可能正在异步挂载/布局，用同一批来源做一次有限重试（非轮询）
+        if (layerBefore === null && readSettingsLayerCache() === null) {
+          if (settleTimer !== 0) clearTimeout(settleTimer);
+          settleTimer = setTimeout(() => {
+            settleTimer = 0;
+            apply(batch);
+          }, 200);
+        }
+      };
+
+      const reapply = () => {
+        raf = 0;
+        const batch = sources.splice(0);
+        if (batch.length === 0) return;
+        const wait = lastProbeAt - Date.now();
+        if (wait > 0) {
+          // 冷却期内：信号延后到冷却结束再探测（面板打开的信号必须被处理，不能丢弃）
+          pendingAfterCooldown = pendingAfterCooldown.concat(batch);
+          if (cooldownTimer === 0) {
+            cooldownTimer = setTimeout(() => {
+              cooldownTimer = 0;
+              const b = pendingAfterCooldown;
+              pendingAfterCooldown = [];
+              if (b.length > 0) runProbe(b);
+            }, wait);
+          }
+          return;
+        }
+        runProbe(batch);
+      };
+
+      const queue = (node) => {
+        if (node !== null && node !== undefined && node.nodeType === 1) {
+          if (sources.length < 200) sources.push(node);
+        }
+        if (raf !== 0) return;
+        raf = requestAnimationFrame(reapply);
+      };
+
+      let observer = null;
+      if (typeof MutationObserver === 'function') {
+        observer = new MutationObserver((mutations) => {
+          for (const m of mutations) {
+            if (m.type === 'childList') {
+              for (const node of m.addedNodes) queue(node);
+            } else if (m.type === 'attributes') {
+              queue(m.target);
+            }
+          }
+        });
+        observer.observe(document.body, {
+          childList: true,
+          subtree: true,
+          attributes: true,
+          attributeFilter: ['class', 'style', 'hidden', 'aria-hidden', 'data-state'],
+        });
+      }
+
+      // 面板打开通常抢焦点：焦点移入作为独立信号（即便 DOM 无变化也能触发）
+      const onFocusIn = (event) => { queue(event.target); };
+      document.addEventListener('focusin', onFocusIn);
+
+      // 点击是打开设置的通用入口：点击后延迟确认一次，
+      // 覆盖“面板已打开但打开信号被错过/面板不抢焦点”的时序
+      const onClick = () => {
+        if (clickTimer !== 0) return;
+        clickTimer = setTimeout(() => {
+          clickTimer = 0;
+          const state = controller.getSnapshot();
+          if (state.status === 'ready') applySettingsOpacity(resolveValue(state.value).uiOpacity, []);
+        }, 120);
+      };
+      document.addEventListener('click', onClick, true);
+
+      return () => {
+        if (observer !== null) observer.disconnect();
+        document.removeEventListener('focusin', onFocusIn);
+        document.removeEventListener('click', onClick, true);
+        if (raf !== 0) cancelAnimationFrame(raf);
+        if (cooldownTimer !== 0) clearTimeout(cooldownTimer);
+        if (clickTimer !== 0) clearTimeout(clickTimer);
+        if (settleTimer !== 0) clearTimeout(settleTimer);
+      };
+    }, 'dsh-ui-tweaks: settings layer watch');
 
     // 设置页面分区
     ctx.slots.inject('settings.section', () => ctx.slots.register({
