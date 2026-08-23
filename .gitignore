@@ -11,7 +11,7 @@ node_modules
 docs
 dist-ssr
 *.local
-.dsh-get
+.dsh-git
 
 # Editor directories and files
 .vscode/*
