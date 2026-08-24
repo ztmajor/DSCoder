@@ -1,0 +1,4 @@
+# dsh-ui-settings bundle patch: mounts the plugin into a profile layer stack.
+- insert:
+    - id: dsh-ui-settings
+      name: 'dsh-ui-settings'

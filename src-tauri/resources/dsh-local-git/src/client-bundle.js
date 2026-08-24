@@ -2,7 +2,7 @@
 // - rpc(method, args) → fetch POST /_dsh/dsh-local-git/<method>（JSON）
 // - 注册到 shell.overlay，渲染底部可展开「本地版本管理」面板：
 //   改动文件列表（增绿/删红/改蓝）+ 逐文件 diff + 提交信息 + 历史回退
-// - 暴露 window.__dshLocalGit 给编辑器做行内 diff 着色（dsh-tabs-terminal 读取）
+// - 暴露 window.__dshLocalGit 给编辑器做行内 diff 着色（dsh-idelike 读取）
 // - 首次检测工作区未启用时提示初始化；AI 每轮回复结束（sessionStats 投影稳定）后
 //   若有改动则提示提交，可开启「自动提交」用默认信息自动提交
 // - React 由 bundle 的 require('react') 提供（seed 模块）
@@ -52,7 +52,7 @@ function relPathOf(ws, abs) {
   return '';
 }
 
-// 与 dsh-tabs-terminal 一致的工作区根解析逻辑。
+// 与 dsh-idelike 一致的工作区根解析逻辑。
 function resolveWorkspaceRoot(items, currentSessionId, recentId) {
   const list = Array.isArray(items) ? items : [];
   if (currentSessionId) {
@@ -360,7 +360,7 @@ function LocalGitPanel(props) {
     return function () { window.clearTimeout(timer); };
   }, [workspace, enabled, statsProj && statsProj.turns, statsProj && statsProj.steps, statsProj && statsProj.decodeTokens, refreshStatus, loadLog]);
 
-  // 监听顶部标签栏图标按钮的切换事件（由 dsh-tabs-terminal 通过 window.__dshLocalGit.toggle 触发）。
+  // 监听顶部标签栏图标按钮的切换事件（由 dsh-idelike 通过 window.__dshLocalGit.toggle 触发）。
   React.useEffect(function () {
     function onToggle() { setExpanded(function (v) { return !v; }); }
     window.addEventListener('dsh-local-git:toggle', onToggle);
@@ -468,7 +468,7 @@ function LocalGitPanel(props) {
   );
 }
 
-// ---------- 编辑器桥接（供 dsh-tabs-terminal 行内着色使用） ----------
+// ---------- 编辑器桥接（供 dsh-idelike 行内着色使用） ----------
 const localGitBridge = {
   diffFile: function (args) {
     const ws = args && args.workspace;

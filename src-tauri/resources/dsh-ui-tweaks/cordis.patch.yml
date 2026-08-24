@@ -1,4 +1,0 @@
-# dsh-ui-tweaks bundle patch: mounts the plugin into a profile layer stack.
-- insert:
-    - id: ui-tweaks
-      name: 'dsh-ui-tweaks'

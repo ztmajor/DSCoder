@@ -73,8 +73,8 @@ async fn spawn_child(state: &Arc<SharedState>) -> Result<Child, DshError> {
         .env("NO_COLOR", "1")
         // 插件记账数据收进 DSCoder 数据目录（默认落在 ~/.dsh）
         .env(
-            "DSH_BOTTOM_INFO_BAR_DATA_DIR",
-            state.dsh_home.join("bottom-info-bar"),
+            "DSH_USAGE_QUOTA_DATA_DIR",
+            state.dsh_home.join("usage-quota"),
         );
     cmd.spawn()
         .map_err(|e| DshError::Invalid {
