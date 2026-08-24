@@ -13,6 +13,10 @@ dist-ssr
 *.local
 .dsh-git
 
+# 自包含运行时产物（由 scripts/prepare-runtime.mjs 生成，不入库）
+src-tauri/resources/node/
+src-tauri/resources/runtime/
+
 # Editor directories and files
 .vscode/*
 .vscode

@@ -22,15 +22,18 @@
 - **内置终端**：真实 PTY（`Ctrl + \`` 呼出），终端优先的编码体验。
 - **DeepSeek 驱动**：模型、会话、工作区、工具、审批等全部能力由 dsh 提供，DSCoder 只做「干净的壳」。
 - **开箱即用**：内置文件树 / 标签页 / 终端、余额信息栏、本地版本管理等插件，首次启动自动装好。
+- **自包含**：安装包内嵌 Node + dsh 运行时，目标机器免装 Node、免联网即可运行。
+- **自动更新**：GitHub Releases 驱动，发现新版弹窗提示，一键更新并自动重启。
 - **干净隔离**：运行时与数据全部收进独立目录，不碰你全局的 dsh（vibe coding 用的那个互不影响）。
 
 ## 工作原理
 
 DSCoder 是一个 Tauri 2（Rust）桌面壳：把 DeepSeek Harness（dsh）作为 sidecar 子进程拉起（`dsh web --port 0 --no-open`），等它就绪后把窗口导航到官方 Web UI（同源加载，天然通过 dsh 的鉴权栅栏）。Rust 侧只负责：
 
-- **运行时自动供给**：首次启动自动下载 `@deepseek-ai/dsh`（锁定 `0.1.1-rc.2`，约 245MB）到应用数据目录。
+- **运行时自动供给**：安装包内嵌 `@deepseek-ai/dsh`（锁定 `0.1.1-rc.2`），首次启动自动解压到应用数据目录；仅开发态才联网下载。
 - **进程监督**：端口发现、健康探活、崩溃退避重启、退出联动。
 - **配置与凭证**：完全交给官方 UI，写入 `$DSH_HOME` 下的 `settings.yaml` 与 `.credentials.yaml`。
+- **自动更新**：后台检查 GitHub Releases，原生对话框确认后下载安装并重启。
 
 ## 项目结构
 
@@ -45,7 +48,12 @@ src-tauri/
   tauri.conf.json      Tauri 配置
 dist/                  启动占位页（内核就绪后跳转到官方 UI）
 docs/                  设计与分析文档
+scripts/               构建/发布脚本（预置运行时、生成 updater 清单）
 ```
+
+## 构建与发布
+
+自包含打包与 GitHub Releases 自动更新，详见 [BUILD.md](BUILD.md)。
 
 ## 感谢
 

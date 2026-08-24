@@ -11,6 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tauri::{AppHandle, Manager, RunEvent};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+use tauri_plugin_updater::UpdaterExt;
 
 use state::{DshStatus, SharedState};
 
@@ -21,7 +23,7 @@ fn init_state(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&data_dir)?;
     let dsh_home = data_dir.join("dsh-home");
     std::fs::create_dir_all(&dsh_home)?;
-    let launch = paths::resolve_launch(&data_dir.join("runtime"));
+    let launch = paths::resolve_launch(app.handle(), &data_dir.join("runtime"));
 
     let shared = Arc::new(SharedState {
         status: tokio::sync::RwLock::new(DshStatus {
@@ -61,6 +63,7 @@ fn init_state(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     tauri::async_runtime::spawn(async move {
         provision::ensure_and_start(handle, st).await;
     });
+    spawn_update_check(app.handle().clone());
     Ok(())
 }
 
@@ -100,9 +103,65 @@ fn open_external_url(url: String) -> Result<(), String> {
     result.map(|_| ()).map_err(|e| e.to_string())
 }
 
+/// 后台检查更新：发现新版弹原生对话框，确认后下载安装并重启。
+/// 更新检查全部在 Rust 侧（窗口会导航到官方 dsh UI，无自建前端）。
+fn spawn_update_check(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        // 延迟几秒，避免与运行时供给/页面导航争抢资源。
+        tokio::time::sleep(Duration::from_secs(8)).await;
+
+        let Ok(updater) = app.updater() else {
+            return;
+        };
+        let update = match updater.check().await {
+            Ok(Some(u)) => u,
+            Ok(None) => return,
+            Err(e) => {
+                eprintln!("[dscoder] 检查更新失败：{e}");
+                return;
+            }
+        };
+
+        let version = update.version.clone();
+        let current = app.package_info().version.to_string();
+        let confirmed = app
+            .dialog()
+            .message(format!("发现新版本 v{version}（当前 v{current}），是否立即更新？"))
+            .title("DSCoder 更新")
+            .kind(MessageDialogKind::Info)
+            .buttons(MessageDialogButtons::OkCancelCustom(
+                "立即更新".into(),
+                "稍后".into(),
+            ))
+            .blocking_show();
+
+        if !confirmed {
+            return;
+        }
+
+        match update.download_and_install(|_len, _total| {}, || {}).await {
+            Ok(()) => {
+                app.request_restart();
+            }
+            Err(e) => {
+                eprintln!("[dscoder] 更新失败：{e}");
+                let _ = app
+                    .dialog()
+                    .message(format!("更新失败：{e}"))
+                    .title("DSCoder")
+                    .kind(MessageDialogKind::Error)
+                    .buttons(MessageDialogButtons::Ok)
+                    .blocking_show();
+            }
+        }
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![open_external_url])
         .setup(init_state)
         .build(tauri::generate_context!())

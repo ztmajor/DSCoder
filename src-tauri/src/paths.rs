@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use tauri::{AppHandle, Manager};
+
 use crate::state::Launch;
 
 /// Windows 短路径（8.3 短名），消除路径中的空格。
@@ -68,7 +70,25 @@ pub fn app_data_root() -> PathBuf {
 /// 3. `where/which dsh` 的 npm shim 反推（全局安装，兜底）。
 /// node 可执行文件：`DSH_NODE` → `where/which node` 第一条存在路径 → shim 同目录
 /// node(.exe)。均失败时兜底裸 `dsh`（仅 Unix 下 npm 的 sh 脚本可直接 exec）。
-pub fn resolve_launch(runtime_dir: &Path) -> Launch {
+/// 内嵌资源路径：dev 源码 `resources/` 优先，打包后 `resource_dir` 兜底。
+/// `rel` 为相对 `resources/` 的路径（如 `node/node.exe`）。
+pub fn embedded_resource(app: &AppHandle, rel: &str) -> Option<PathBuf> {
+    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("resources")
+        .join(rel);
+    if dev.exists() {
+        return Some(dev);
+    }
+    if let Ok(res) = app.path().resource_dir() {
+        let p = res.join(rel);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+pub fn resolve_launch(app: &AppHandle, runtime_dir: &Path) -> Launch {
     let dedicated = runtime_dir
         .join("node_modules")
         .join("@deepseek-ai")
@@ -98,11 +118,14 @@ pub fn resolve_launch(runtime_dir: &Path) -> Launch {
             .find(|p| p.exists())
     };
 
-    // node：`where node` 优先；退而求其次 npm shim 同目录 node(.exe)。
+    // node 优先级：DSH_NODE → 内嵌 node.exe → where node → npm shim 同目录 node(.exe)。
+    // 内嵌 node.exe 保证目标机无需安装 Node。
+    let embedded_node = embedded_resource(app, "node/node.exe");
     let node = std::env::var("DSH_NODE")
         .ok()
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
+        .or_else(|| embedded_node.clone())
         .or_else(|| {
             find("node").or_else(|| {
                 find("dsh").and_then(|shim| {

@@ -105,7 +105,32 @@ async fn check_tools() -> Result<(), String> {
     Ok(())
 }
 
-/// 确保 dsh 运行时已安装；缺失/损坏时用 pnpm 安装（首次约 245MB）。
+/// 解压内嵌的运行时 zip（单文件产物，避免 3 万小文件拖慢安装包构建/安装）。
+fn extract_zip(src: &Path, dst: &Path) -> Result<(), String> {
+    let file = std::fs::File::open(src).map_err(|e| format!("打开运行时包失败：{e}"))?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("读取运行时包失败：{e}"))?;
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| format!("读取运行时条目 {i} 失败：{e}"))?;
+        let Some(rel) = entry.enclosed_name() else {
+            continue; // 拒绝 zip-slip
+        };
+        let out = dst.join(rel);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out).map_err(|e| format!("创建目录失败：{e}"))?;
+        } else {
+            if let Some(parent) = out.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败：{e}"))?;
+            }
+            let mut f = std::fs::File::create(&out).map_err(|e| format!("创建文件失败：{e}"))?;
+            std::io::copy(&mut entry, &mut f).map_err(|e| format!("写入文件失败：{e}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// 确保 dsh 运行时已安装；优先解压内置包（离线/自包含），缺失时才回退 pnpm 安装（首次约 245MB）。
 async fn ensure_runtime(state: &Arc<SharedState>, app: &AppHandle) -> Result<(), String> {
     eprintln!("[dscoder] ensure_runtime: enter");
     let bin = runtime_bin();
@@ -115,6 +140,35 @@ async fn ensure_runtime(state: &Arc<SharedState>, app: &AppHandle) -> Result<(),
         return Ok(());
     }
 
+    let runtime_dir = paths::app_data_root().join("runtime");
+
+    // 优先：内置 dsh-runtime.zip（自包含 / 离线），解压到数据目录。
+    if let Some(zip) = paths::embedded_resource(app, "runtime/dsh-runtime.zip") {
+        set_status(
+            app,
+            state,
+            DshStatus {
+                state: "provisioning".into(),
+                port: None,
+                pid: None,
+                attempt: 0,
+                message: Some("正在解压内置 dsh 运行时…".into()),
+            },
+        )
+        .await;
+        std::fs::create_dir_all(&runtime_dir).map_err(|e| format!("创建运行时目录失败：{e}"))?;
+        let zip_path = zip.clone();
+        let rt = runtime_dir.clone();
+        tokio::task::spawn_blocking(move || extract_zip(&zip_path, &rt))
+            .await
+            .map_err(|e| format!("解压任务失败：{e}"))??;
+        if !runtime_bin().exists() {
+            return Err("内置运行时解压后未找到 bin.js".into());
+        }
+        return Ok(());
+    }
+
+    // 回退：联网 pnpm 安装（开发态、未打内置包时）。
     set_status(
         app,
         state,
@@ -129,7 +183,6 @@ async fn ensure_runtime(state: &Arc<SharedState>, app: &AppHandle) -> Result<(),
     .await;
 
     check_tools().await?;
-    let runtime_dir = paths::app_data_root().join("runtime");
     std::fs::create_dir_all(&runtime_dir).map_err(|e| format!("创建运行时目录失败：{e}"))?;
     let args = vec![
         "--dir".to_string(),
