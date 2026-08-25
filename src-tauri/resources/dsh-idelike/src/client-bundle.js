@@ -390,7 +390,7 @@ function installStyles() {
     /* 应用容器 box-sizing 便于内部 padding（顶部标签栏 + 右侧文件树）不撑破 100% 高度 */
     #root { box-sizing: border-box; }
 
-    .dtt-root { position: fixed; inset: 0; pointer-events: none; z-index: 40; font-family: var(--dsw-font-family, inherit); }
+    .dtt-root { position: fixed; inset: 0; pointer-events: none; z-index: 30; font-family: var(--dsw-font-family, inherit); }
 
     /* ---------- 顶部标签栏 ---------- */
     .dtt-tabbar {
@@ -400,7 +400,7 @@ function installStyles() {
       border-bottom: 1px solid var(--dsw-alias-border-l3, rgba(0,0,0,0.1));
       box-shadow: 0 1px 3px rgba(0,0,0,0.06);
       pointer-events: auto; overflow-x: auto; overflow-y: hidden;
-      font-size: 13px; line-height: 20px; scrollbar-width: thin; z-index: 40;
+      font-size: 13px; line-height: 20px; scrollbar-width: thin; z-index: 32;
     }
     /* 顶部标签栏横向滚动条：变细、隐藏左右箭头、弱化配色 */
     .dtt-tabbar::-webkit-scrollbar { height: 4px; }
@@ -450,7 +450,7 @@ function installStyles() {
     /* ---------- 右侧文件树 ---------- */
     .dtt-tree {
       position: fixed; top: ${TAB_BAR_HEIGHT}px; right: 0; bottom: 0; width: ${TREE_DEFAULT_WIDTH}px;
-      display: flex; flex-direction: column; pointer-events: auto; z-index: 39;
+      display: flex; flex-direction: column; pointer-events: auto; z-index: 33;
       background: var(--dsw-alias-bg-base, #fff);
       border-left: 1px solid var(--dsw-alias-border-l1, rgba(0,0,0,0.1));
       font-size: 13px; line-height: 20px; color: var(--dsw-alias-label-primary, #0f1115);
@@ -500,7 +500,7 @@ function installStyles() {
     .dtt-tree-empty, .dtt-tree-error, .dtt-tree-loading { padding: 10px 14px; color: var(--dsw-alias-label-tertiary, rgba(128,128,128,0.9)); font-size: 12px; line-height: 18px; }
     .dtt-tree-error { color: var(--dsw-alias-state-error-primary, #dc2626); }
     .dtt-tree-resize {
-      position: fixed; top: ${TAB_BAR_HEIGHT}px; bottom: 0; width: 5px; cursor: col-resize; z-index: 40;
+      position: fixed; top: ${TAB_BAR_HEIGHT}px; bottom: 0; width: 5px; cursor: col-resize; z-index: 34;
       background: transparent; pointer-events: auto;
     }
     .dtt-tree-resize:hover { background: rgba(0,0,0,0.08); }
@@ -508,7 +508,7 @@ function installStyles() {
     /* ---------- 可编辑文件查看 ---------- */
     .dtt-editor-area {
       position: fixed; top: 0; left: 0; bottom: 0;
-      display: flex; flex-direction: row; z-index: 38; pointer-events: none;
+      display: flex; flex-direction: row; z-index: 31; pointer-events: none;
     }
     .dtt-pane {
       position: relative; flex: 1 1 auto; min-width: 0; min-height: 0;
@@ -615,7 +615,7 @@ function installStyles() {
     .dtt-terminal {
       position: fixed; left: 0; right: 0; bottom: 0;
       height: clamp(180px, 40vh, 70vh);
-      display: flex; flex-direction: column; pointer-events: auto; z-index: 42;
+      display: flex; flex-direction: column; pointer-events: auto; z-index: 35;
       background: var(--dsw-alias-bg-base, #fff); color: var(--dsw-alias-label-primary, #0f1115);
       border-top: 1px solid var(--dsw-alias-border-l1, rgba(0,0,0,0.1));
       font-family: var(--dsw-font-mono, ui-monospace, 'Cascadia Code', Consolas, monospace);

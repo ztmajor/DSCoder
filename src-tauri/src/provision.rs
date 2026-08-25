@@ -241,11 +241,18 @@ fn discover_plugins(app: &AppHandle) -> Vec<Plugin> {
     };
 
     let mut roots: Vec<PathBuf> = Vec::new();
-    roots.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources"));
-    if let Ok(res) = app.path().resource_dir() {
-        // Windows 上资源位于 resource_dir()/resources/ 子目录；两种布局都兼容。
-        roots.push(res.join("resources"));
-        roots.push(res);
+    let dev_src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
+    roots.push(dev_src.clone());
+    if !dev_src.is_dir() {
+        // dev 源码不存在（打包后的用户机器）：回退到 resource_dir 的安装包资源。
+        // 开发机上不扫 resource_dir：那里是 tauri 构建产物（target/debug/resources）
+        // 的副本，可能是插件改名/删除前的旧拷贝，会把已不存在的旧名字插件重新发现
+        // 并注册回 profile，造成"同一插件装了两遍"。
+        if let Ok(res) = app.path().resource_dir() {
+            // Windows 上资源位于 resource_dir()/resources/ 子目录；两种布局都兼容。
+            roots.push(res.join("resources"));
+            roots.push(res);
+        }
     }
 
     let mut seen: std::collections::BTreeMap<String, Plugin> = Default::default();
@@ -495,12 +502,91 @@ async fn ensure_one_plugin(
     Ok(())
 }
 
+/// 清理孤儿插件：web profile 的 `node_modules` 下带 `.dsh-source-digest`
+/// （provision 写入的所有权标记）但已不在当前发现清单里的包——通常是内置插件
+/// 改名或移除后残留的旧名字副本。把它们的名字从 profile 的
+/// `dsh.profile.bundles` 与 `dependencies` 中移除，并删除目录本身。
+/// 市场/手动安装的插件没有该标记，不会被误删。
+fn prune_orphan_plugins(keep: &[&str]) -> Result<(), String> {
+    let nm = profile_dir().join("node_modules");
+    let mut orphans: Vec<String> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&nm) {
+        for entry in rd.flatten() {
+            let Ok(ty) = entry.file_type() else {
+                continue;
+            };
+            if !ty.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if entry.path().join(DIGEST_MARKER).exists() && !keep.contains(&name.as_str()) {
+                orphans.push(name);
+            }
+        }
+    }
+    if orphans.is_empty() {
+        return Ok(());
+    }
+    orphans.sort();
+    eprintln!(
+        "[dscoder] prune_orphan_plugins: 清理 {} 个孤儿插件：{:?}",
+        orphans.len(),
+        orphans
+    );
+
+    // 1) 从 profile manifest 移除孤儿名字（bundles 与 dependencies）。
+    let pkg = profile_package();
+    let text = std::fs::read_to_string(&pkg).map_err(|e| format!("读取 profile 失败：{e}"))?;
+    let mut json: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("解析 profile 失败：{e}"))?;
+    let is_orphan = |name: &str| orphans.iter().any(|o| o == name);
+    let mut changed = false;
+    if let Some(bundles) = json
+        .get_mut("dsh")
+        .and_then(|d| d.get_mut("profile"))
+        .and_then(|p| p.get_mut("bundles"))
+        .and_then(|b| b.as_array_mut())
+    {
+        let before = bundles.len();
+        bundles.retain(|v| !v.as_str().map(is_orphan).unwrap_or(false));
+        changed |= bundles.len() != before;
+    }
+    if let Some(deps) = json.get_mut("dependencies").and_then(|d| d.as_object_mut()) {
+        let before = deps.len();
+        deps.retain(|k, _| !is_orphan(k));
+        changed |= deps.len() != before;
+    }
+    if changed {
+        let out = serde_json::to_string_pretty(&json)
+            .map_err(|e| format!("序列化 profile 失败：{e}"))?;
+        std::fs::write(&pkg, format!("{out}\n")).map_err(|e| format!("写入 profile 失败：{e}"))?;
+        eprintln!("[dscoder] prune_orphan_plugins: 已从 profile manifest 移除旧名字登记");
+    }
+
+    // 2) 删除残留目录。Rust std 的 remove_dir_all 不跟随 junction/符号链接
+    //    （只删链接本身，不会删到目标目录），普通目录则递归删除。
+    for name in &orphans {
+        let dir = nm.join(name);
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => eprintln!("[dscoder] prune_orphan_plugins: 已删除残留目录 {name}"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!("[dscoder] prune_orphan_plugins: 删除 {name} 失败：{e}"),
+        }
+    }
+    Ok(())
+}
+
 /// 确保全部内置插件已安装（逐个幂等）；清单由目录自动发现，无需手工登记。
 async fn ensure_plugins(app: &AppHandle, state: &Arc<SharedState>) -> Result<(), String> {
     let plugins = discover_plugins(app);
     for plugin in &plugins {
         ensure_one_plugin(app, state, plugin).await?;
     }
+    // 收敛改名/移除后的残留：保留基础 bundle 与当前发现到的插件，
+    // 其余带 provision 标记的旧名字副本从 profile 清理掉。
+    let mut keep: Vec<&str> = DEFAULT_WEB_BUNDLES.to_vec();
+    keep.extend(plugins.iter().map(|p| p.name.as_str()));
+    prune_orphan_plugins(&keep)?;
     Ok(())
 }
 
