@@ -80,9 +80,14 @@ pub fn embedded_resource(app: &AppHandle, rel: &str) -> Option<PathBuf> {
         return Some(dev);
     }
     if let Ok(res) = app.path().resource_dir() {
-        let p = res.join(rel);
-        if p.exists() {
-            return Some(p);
+        // Windows 上 resource_dir() 返回 exe 所在目录，资源实际位于其 `resources/` 子目录。
+        let in_sub = res.join("resources").join(rel);
+        if in_sub.exists() {
+            return Some(in_sub);
+        }
+        let direct = res.join(rel);
+        if direct.exists() {
+            return Some(direct);
         }
     }
     None
@@ -136,24 +141,11 @@ pub fn resolve_launch(app: &AppHandle, runtime_dir: &Path) -> Launch {
             })
         });
 
-    // JS 入口：专用安装 → 全局 shim 反推。
-    let js = if dedicated.exists() {
-        Some(dedicated)
-    } else {
-        find("dsh").and_then(|shim| {
-            shim.parent().map(|prefix| {
-                prefix
-                    .join("node_modules")
-                    .join("@deepseek-ai")
-                    .join("dsh")
-                    .join("lib")
-                    .join("bin.js")
-            })
-        })
-    }
-    .filter(|p| p.exists());
+    // JS 入口：始终用专用安装的 bin.js；ensure_runtime 会在 spawn 前把它创建好（解压或 pnpm 安装）。
+    // 不再回退全局 dsh——否则"全新机器首次启动时专用运行时尚未解压、全局 dsh 又不存在"会导致启动失败。
+    let js = dedicated;
 
-    if let (Some(node), Some(js)) = (node, js) {
+    if let Some(node) = node {
         if node.exists() {
             return Launch {
                 program: node.to_string_lossy().into_owned(),

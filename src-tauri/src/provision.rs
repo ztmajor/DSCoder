@@ -40,8 +40,13 @@ fn dsh_home() -> PathBuf {
     paths::app_data_root().join("dsh-home")
 }
 
+fn profile_dir() -> PathBuf {
+    dsh_home().join("profiles").join("web")
+}
+
 fn plugin_install_dir(name: &str) -> PathBuf {
-    paths::app_data_root().join("plugins").join(name)
+    // 直接装进 web profile 的 node_modules，dsh 会从那里解析 bundle（无需 pnpm link）。
+    profile_dir().join("node_modules").join(name)
 }
 
 fn profile_package() -> PathBuf {
@@ -82,6 +87,8 @@ async fn run_program(
     for (k, v) in envs {
         cmd.env(k, v);
     }
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW：不让 node/pnpm 弹出控制台窗口
     let out = cmd
         .output()
         .await
@@ -236,6 +243,8 @@ fn discover_plugins(app: &AppHandle) -> Vec<Plugin> {
     let mut roots: Vec<PathBuf> = Vec::new();
     roots.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources"));
     if let Ok(res) = app.path().resource_dir() {
+        // Windows 上资源位于 resource_dir()/resources/ 子目录；两种布局都兼容。
+        roots.push(res.join("resources"));
         roots.push(res);
     }
 
@@ -359,6 +368,49 @@ fn store_digest(dir: &Path, digest: u64) {
     let _ = std::fs::write(dir.join(DIGEST_MARKER), digest.to_string());
 }
 
+/// web profile 的基础 bundle（dsh 内置，与 @deepseek-ai/dsh@0.1.1-rc.2 一致）。
+const DEFAULT_WEB_BUNDLES: &[&str] = &["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"];
+
+/// 确保 web profile 目录与 manifest 存在（缺失时写入基础 bundle 模板）。
+fn ensure_profile() -> Result<(), String> {
+    let dir = profile_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建 profile 目录失败：{e}"))?;
+    let pkg = dir.join("package.json");
+    if !pkg.exists() {
+        let json = serde_json::json!({
+            "name": "dsh-profile-web",
+            "private": true,
+            "dependencies": {},
+            "dsh": { "profile": { "bundles": DEFAULT_WEB_BUNDLES } }
+        });
+        let text = serde_json::to_string_pretty(&json)
+            .map_err(|e| format!("序列化 profile 失败：{e}"))?;
+        std::fs::write(&pkg, format!("{text}\n")).map_err(|e| format!("写入 profile 失败：{e}"))?;
+    }
+    Ok(())
+}
+
+/// 把插件名追加进 profile 的 `dsh.profile.bundles`（幂等）。
+fn add_plugin_to_bundles(name: &str) -> Result<(), String> {
+    let pkg = profile_package();
+    let text = std::fs::read_to_string(&pkg).map_err(|e| format!("读取 profile 失败：{e}"))?;
+    let mut json: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("解析 profile 失败：{e}"))?;
+    let bundles = json
+        .get_mut("dsh")
+        .and_then(|d| d.get_mut("profile"))
+        .and_then(|p| p.get_mut("bundles"))
+        .and_then(|b| b.as_array_mut())
+        .ok_or_else(|| "profile manifest 缺少 dsh.profile.bundles".to_string())?;
+    if !bundles.iter().any(|v| v.as_str() == Some(name)) {
+        bundles.push(serde_json::Value::String(name.to_string()));
+    }
+    let out = serde_json::to_string_pretty(&json)
+        .map_err(|e| format!("序列化 profile 失败：{e}"))?;
+    std::fs::write(&pkg, format!("{out}\n")).map_err(|e| format!("写入 profile 失败：{e}"))?;
+    Ok(())
+}
+
 /// 确保插件已安装进 web profile；缺失时复制内置产物并 `dsh plugin add`（幂等）。
 /// `plugin.src` 已由 `discover_plugins` 定位，故这里不再做"找不到源"的兜底。
 async fn ensure_one_plugin(
@@ -431,30 +483,14 @@ async fn ensure_one_plugin(
     store_digest(&installed, source_digest(src));
     eprintln!("[dscoder] ensure_plugin({name}): copied to {}", installed.display());
 
-    // 准备并执行 plugin add 命令
-    let bin = runtime_bin();
-    let home = dsh_home();
-    let args = vec![
-        bin.display().to_string(),
-        "plugin".to_string(),
-        "--profile".to_string(),
-        "web".to_string(),
-        "add".to_string(),
-        installed.display().to_string(),
-    ];
-    eprintln!("[dscoder] ensure_plugin({name}): running plugin add: node {:?}", args);
-    run_program(
-        "node",
-        &args,
-        &[("DSH_HOME", home.to_str().unwrap_or_default())],
-        "插件安装",
-    )
-    .await?;
-    eprintln!("[dscoder] ensure_plugin({name}): plugin add done, registered={}", plugin_registered(name));
+    // 注册到 web profile：写 dsh.profile.bundles（无需 pnpm，dsh 会从 profile/node_modules 解析）。
+    ensure_profile()?;
+    add_plugin_to_bundles(name)?;
+    eprintln!("[dscoder] ensure_plugin({name}): registered, bundles updated");
 
     // 5. 校验安装结果
     if !plugin_registered(name) {
-        return Err(format!("插件 {name} 安装后未在 web profile 生效"));
+        return Err(format!("插件 {name} 注册后未在 web profile 生效"));
     }
     Ok(())
 }

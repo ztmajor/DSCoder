@@ -91,16 +91,23 @@ fn open_external_url(url: String) -> Result<(), String> {
     if !url.starts_with("http://") && !url.starts_with("https://") {
         return Err("only http/https URLs are allowed".to_string());
     }
-    let result = if cfg!(target_os = "windows") {
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", &url])
-            .spawn()
-    } else if cfg!(target_os = "macos") {
-        std::process::Command::new("open").arg(&url).spawn()
-    } else {
-        std::process::Command::new("xdg-open").arg(&url).spawn()
-    };
-    result.map(|_| ()).map_err(|e| e.to_string())
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/C", "start", "", &url])
+            .creation_flags(0x0800_0000); // CREATE_NO_WINDOW：不让 cmd 闪出控制台窗口
+        return cmd.spawn().map(|_| ()).map_err(|e| e.to_string());
+    }
+    #[cfg(not(windows))]
+    {
+        let result = if cfg!(target_os = "macos") {
+            std::process::Command::new("open").arg(&url).spawn()
+        } else {
+            std::process::Command::new("xdg-open").arg(&url).spawn()
+        };
+        result.map(|_| ()).map_err(|e| e.to_string())
+    }
 }
 
 /// 后台检查更新：发现新版弹原生对话框，确认后下载安装并重启。
