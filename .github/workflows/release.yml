@@ -54,7 +54,24 @@ jobs:
         with:
           tagName: v__VERSION__
           releaseName: 'DSCoder v__VERSION__'
-          releaseBody: '下载下方对应平台的安装包安装。'
+          releaseBody: |
+            DSCoder 是一个干净的、终端优先的 AI 编码壳（Tauri 桌面版 DeepSeek Harness）。
+
+            ## 🐛 修复
+            - 修复全新电脑首次启动卡在「正在启动 dsh 内核」的问题
+            - 修复启动时弹出的黑色控制台窗口
+
+            ## ✨ 特性
+            - 自包含：内嵌 Node 与 dsh 运行时，免装 Node/pnpm、免联网
+            - 内置插件：文件树/标签页/终端、余额信息栏、本地版本管理、界面调整
+            - 自动更新：检测到新版弹窗提示，一键更新并重启
+            - 干净隔离：数据收进独立目录，不碰全局 dsh
+
+            ## 📦 安装
+            下载下方 `dscoder_*_x64-setup.exe`（Windows x64）安装即可。首次启动解压内置运行时稍慢，之后秒开。
+
+            ## ⚠️ 说明
+            安装包未做代码签名，Windows 会弹 SmartScreen 提示，点「更多信息 → 仍要运行」即可。
           releaseDraft: true
           prerelease: false
           includeUpdaterJson: true

@@ -61,6 +61,8 @@ async fn spawn_child(state: &Arc<SharedState>) -> Result<Child, DshError> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW：不让 node 弹出控制台窗口
     // 先剔除可能干扰的继承变量，再写入我们自己的值。
     for (key, _value) in std::env::vars() {
         let prefix = key.starts_with("DSH_") || key.starts_with("CORDIS_");
