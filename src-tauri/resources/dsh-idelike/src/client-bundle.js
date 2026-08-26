@@ -15,6 +15,7 @@ const RPC_TIMEOUT_MS = 20000;
 const TERM_POLL_MS = 120;       // 终端输出轮询间隔
 const MAX_DISPLAY_CHARS = 128 * 1024; // 客户端终端显示缓冲上限
 const TAB_BAR_HEIGHT = 34;      // 顶部标签栏高度 px
+const TREE_SLIDE_MS = 200;      // 文件树开合过渡时长 ms（树 transform / 编辑区 right / #root padding-right 三者同步）
 const TREE_DEFAULT_WIDTH = 240; // 文件树默认宽度 px
 const TREE_MIN_WIDTH = 180;
 const TREE_MAX_WIDTH = 520;
@@ -448,13 +449,18 @@ function installStyles() {
     .dtt-spacer { flex: 1 1 auto; }
 
     /* ---------- 右侧文件树 ---------- */
+    /* 树顶对齐 div.root 顶部（top: 0），避免主题切换时树上方露出与文件树不同色的一块 */
     .dtt-tree {
-      position: fixed; top: ${TAB_BAR_HEIGHT}px; right: 0; bottom: 0; width: ${TREE_DEFAULT_WIDTH}px;
+      position: fixed; top: 0; right: 0; bottom: 0; width: ${TREE_DEFAULT_WIDTH}px;
       display: flex; flex-direction: column; pointer-events: auto; z-index: 33;
       background: var(--dsw-alias-bg-base, #fff);
       border-left: 1px solid var(--dsw-alias-border-l1, rgba(0,0,0,0.1));
       font-size: 13px; line-height: 20px; color: var(--dsw-alias-label-primary, #0f1115);
+      transition: transform ${TREE_SLIDE_MS}ms ease;
+      will-change: transform;
     }
+    /* 收起状态：整棵文件树滑出屏幕右侧（与 .dtt-editor-area 的 right、#root 的 padding-right 同步过渡） */
+    .dtt-tree.dtt-tree-hidden { transform: translateX(100%); }
     .dtt-tree-header {
       flex: 0 0 auto; display: flex; align-items: center; gap: 4px; padding: 6px 8px;
       border-bottom: 1px solid var(--dsw-alias-border-l3, rgba(0,0,0,0.08));
@@ -500,15 +506,21 @@ function installStyles() {
     .dtt-tree-empty, .dtt-tree-error, .dtt-tree-loading { padding: 10px 14px; color: var(--dsw-alias-label-tertiary, rgba(128,128,128,0.9)); font-size: 12px; line-height: 18px; }
     .dtt-tree-error { color: var(--dsw-alias-state-error-primary, #dc2626); }
     .dtt-tree-resize {
-      position: fixed; top: ${TAB_BAR_HEIGHT}px; bottom: 0; width: 5px; cursor: col-resize; z-index: 34;
+      position: fixed; top: 0; bottom: 0; width: 5px; cursor: col-resize; z-index: 34;
       background: transparent; pointer-events: auto;
     }
     .dtt-tree-resize:hover { background: rgba(0,0,0,0.08); }
+
+    /* 系统开启"减少动态效果"时，跳过文件树开合过渡，直接切换 */
+    @media (prefers-reduced-motion: reduce) {
+      .dtt-tree, .dtt-editor-area { transition: none !important; }
+    }
 
     /* ---------- 可编辑文件查看 ---------- */
     .dtt-editor-area {
       position: fixed; top: 0; left: 0; bottom: 0;
       display: flex; flex-direction: row; z-index: 31; pointer-events: none;
+      transition: right ${TREE_SLIDE_MS}ms ease;
     }
     .dtt-pane {
       position: relative; flex: 1 1 auto; min-width: 0; min-height: 0;
@@ -825,7 +837,10 @@ module.exports = {
       else if (root.status === 'error') body = React.createElement('div', { className: 'dtt-tree-error' }, root.error);
       else body = rows;
 
-      return React.createElement('div', { className: 'dtt-tree', style: { width: props.width + 'px' } },
+      return React.createElement('div', {
+        className: 'dtt-tree' + (props.hidden ? ' dtt-tree-hidden' : ''),
+        style: { width: props.width + 'px' },
+      },
         React.createElement('div', { className: 'dtt-tree-header' },
           React.createElement('span', { className: 'dtt-tree-title', title: root.path }, '资源管理器'),
           React.createElement('button', {
@@ -862,6 +877,8 @@ module.exports = {
       const [panes, setPanes] = React.useState([{ id: 'p0', files: [], activePath: null }]); // 编辑 pane（主 pane 恒在）
       const [activePaneId, setActivePaneId] = React.useState('p0'); // 聚焦 pane
       const paneSeqRef = React.useRef(1);
+      const resizeActiveRef = React.useRef(false); // 拖拽调宽中：关闭 right/padding-right 过渡，防止内容滞后于手柄
+      const padArmedRef = React.useRef(false);     // #root padding-right 过渡是否已启用（插件启动后首帧再启用）
       const [treeOpen, setTreeOpen] = React.useState(true);
       const [treeWidth, setTreeWidth] = React.useState(TREE_DEFAULT_WIDTH);
       const [treeRoot, setTreeRoot] = React.useState(null); // null → 自动取工作区/主目录
@@ -992,16 +1009,25 @@ module.exports = {
       }
 
       // 把应用整体下移（顶部标签栏）并左移（右侧文件树），退出时还原。
+      // 首帧之后再启用 padding-right 过渡：避免插件启动时内容从 0 → treeWidth 播放一次动画；
+      // 拖拽调宽期间保持关闭，避免内容逐帧追赶手柄产生滞后。
       React.useEffect(function () {
         const rootEl = document.getElementById('root');
         if (!rootEl) return;
         const prevTop = rootEl.style.paddingTop;
         const prevRight = rootEl.style.paddingRight;
+        const prevTransition = rootEl.style.transition;
         rootEl.style.paddingTop = TAB_BAR_HEIGHT + 'px';
         rootEl.style.paddingRight = treeOpen ? treeWidth + 'px' : '0px';
+        const reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+        rootEl.style.transition = (padArmedRef.current && !resizeActiveRef.current && !reduced)
+          ? 'padding-right ' + TREE_SLIDE_MS + 'ms ease'
+          : 'none';
+        padArmedRef.current = true;
         return function () {
           rootEl.style.paddingTop = prevTop;
           rootEl.style.paddingRight = prevRight;
+          rootEl.style.transition = prevTransition;
         };
       }, [treeOpen, treeWidth]);
 
@@ -1192,7 +1218,11 @@ module.exports = {
 
       const editorArea = React.createElement('div', {
         className: 'dtt-editor-area',
-        style: { right: treeOpen ? treeWidth + 'px' : '0px' },
+        style: {
+          right: treeOpen ? treeWidth + 'px' : '0px',
+          // 拖拽调宽期间内联关掉过渡，否则编辑区会逐帧追赶手柄产生滞后；开合时才走 CSS 平滑过渡
+          transition: resizeActiveRef.current ? 'none' : undefined,
+        },
       }, panes.map(function (pane, i) { return renderPane(pane, i === 0); }));
 
       // 用原生 OS 目录选择器（与 DSH core 添加工作区一致）切换文件树根。
@@ -1210,17 +1240,21 @@ module.exports = {
       }
 
       // ---------- 文件树（含拖拽调宽手柄） ----------
+      // 树常驻挂载，用 .dtt-tree-hidden（translateX(100%)）控制显隐：
+      // 开合时右侧顺滑滑入/滑出，且目录列表、折叠状态在收起后保留，再次打开无需重新加载。
       const treeRootPath = resolveTreeRoot();
-      const tree = treeOpen ? React.createElement(FileTreePanel, {
+      const tree = React.createElement(FileTreePanel, {
         root: treeRootPath,
         width: treeWidth,
+        hidden: !treeOpen,
         onOpenFile: openFile,
         onPickRoot: pickRootDir,
-      }) : null;
+      });
 
       // 拖拽调整文件树宽度（树在右侧：向左拖加宽）。
       function startResize(e) {
         e.preventDefault();
+        resizeActiveRef.current = true;
         const startX = e.clientX;
         const startW = treeWidth;
         function onMove(ev) {
@@ -1228,6 +1262,7 @@ module.exports = {
           setTreeWidth(w);
         }
         function onUp() {
+          resizeActiveRef.current = false;
           window.removeEventListener('pointermove', onMove);
           window.removeEventListener('pointerup', onUp);
         }
