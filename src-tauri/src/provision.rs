@@ -49,6 +49,109 @@ fn plugin_install_dir(name: &str) -> PathBuf {
     profile_dir().join("node_modules").join(name)
 }
 
+/// 内置插件的真实文件家：`<data>/plugins/<name>`。market 的 `dependencies` 用
+/// `link:` 指向这里，`node_modules/<name>` 则是通向它的 junction——与
+/// `dsh plugin add` 产出的本地插件布局一致，否则 market 的「已安装」列表
+/// （读 `dependencies`）看不到只登记了 `dsh.profile.bundles` 的内置插件
+/// （如 dsh-task-board）。
+fn plugin_store_dir(name: &str) -> PathBuf {
+    paths::app_data_root().join("plugins").join(name)
+}
+
+/// 在 `node_modules/<name>` 建立指向 `plugins/<name>` 的 junction（Windows）或
+/// 符号链接（其他平台），使内置插件以与 `dsh plugin add` 一致的方式出现在
+/// profile 的 node_modules 中，同时真实文件落在 `plugins/` 下（market 的
+/// `link:` 依赖指向那里，pnpm 解析 link: 时不会自环）。
+///
+/// 返回 `true` 表示这次真的创建了链接（用于日志）；`false` 表示链接已就位。
+fn ensure_plugin_link(name: &str) -> Result<bool, String> {
+    let store = plugin_store_dir(name);
+    let link = plugin_install_dir(name);
+
+    // 已是可用的链接（junction/符号链接）且指向正确目标：无需处理。
+    if let Ok(target) = std::fs::read_link(&link) {
+        if target == store {
+            return Ok(false);
+        }
+        // 指向别处：先移除旧链接，再重建。
+        let _ = std::fs::remove_dir_all(&link);
+    }
+
+    // 旧布局把文件直接复制进了 node_modules/<name>（真实目录，无链接）。
+    // 把它整体"搬"成 store 目录（保留文件），而不是删除重建。
+    if link.exists() {
+        if let Ok(meta) = std::fs::symlink_metadata(&link) {
+            if meta.file_type().is_dir() && !meta.file_type().is_symlink() {
+                if !store.exists() {
+                    if let Some(parent) = store.parent() {
+                        std::fs::create_dir_all(parent)
+                            .map_err(|e| format!("创建插件目录失败：{e}"))?;
+                    }
+                    std::fs::rename(&link, &store)
+                        .map_err(|e| format!("迁移旧插件目录失败：{e}"))?;
+                } else {
+                    // store 已有权威内容，旧的 node_modules 拷贝直接丢弃。
+                    std::fs::remove_dir_all(&link)
+                        .map_err(|e| format!("清理旧插件目录失败：{e}"))?;
+                }
+            }
+        }
+    }
+
+    // 目标目录必须存在（junction 的目标是真实目录）。
+    std::fs::create_dir_all(&store).map_err(|e| format!("创建插件目录失败：{e}"))?;
+
+    create_plugin_link(&link, &store)?;
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn create_plugin_link(link: &std::path::Path, store: &std::path::Path) -> Result<(), String> {
+    // junction 用 mklink /J（无需管理员权限；符号链接需要）。
+    let status = std::process::Command::new("cmd")
+        .arg("/C")
+        .arg("mklink")
+        .arg("/J")
+        .arg(link)
+        .arg(store)
+        .status()
+        .map_err(|e| format!("创建 junction 失败：{e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("创建 junction 失败：mklink /J 返回非零状态".to_string())
+    }
+}
+
+#[cfg(not(windows))]
+fn create_plugin_link(link: &std::path::Path, store: &std::path::Path) -> Result<(), String> {
+    std::os::unix::fs::symlink(store, link).map_err(|e| format!("创建符号链接失败：{e}"))
+}
+
+/// 把内置插件写进 profile `package.json` 的 `dependencies`（幂等），spec 为
+/// `link:<短路径>/plugins/<name>`。market 的「已安装」页读的就是 `dependencies`
+/// （见 `readInstalled()`），只有 `dsh.profile.bundles` 登记不足以让它显示。
+fn add_plugin_to_dependencies(name: &str) -> Result<(), String> {
+    let pkg = profile_package();
+    let text = std::fs::read_to_string(&pkg).map_err(|e| format!("读取 profile 失败：{e}"))?;
+    let mut json: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("解析 profile 失败：{e}"))?;
+    let deps = json
+        .get_mut("dependencies")
+        .and_then(|d| d.as_object_mut())
+        .ok_or_else(|| "profile manifest 缺少 dependencies".to_string())?;
+    if deps.contains_key(name) {
+        return Ok(());
+    }
+    let store = plugin_store_dir(name);
+    let spec = format!("link:{}", store.to_string_lossy().replace('\\', "/"));
+    deps.insert(name.to_string(), serde_json::Value::String(spec));
+    let out = serde_json::to_string_pretty(&json)
+        .map_err(|e| format!("序列化 profile 失败：{e}"))?;
+    std::fs::write(&pkg, format!("{out}\n")).map_err(|e| format!("写入 profile 失败：{e}"))?;
+    Ok(())
+}
+
 fn profile_package() -> PathBuf {
     dsh_home().join("profiles").join("web").join("package.json")
 }
@@ -427,6 +530,8 @@ async fn ensure_one_plugin(
 ) -> Result<(), String> {
     let name = plugin.name.as_str();
     let src = plugin.src.as_path();
+    let store = plugin_store_dir(name);
+    // node_modules/<name>：junction 指向 store 的视图（穿透后即真实文件）。
     let installed = plugin_install_dir(name);
 
     eprintln!(
@@ -436,11 +541,14 @@ async fn ensure_one_plugin(
         plugin_registered(name)
     );
 
+    // 已注册分支同样要保证 junction 与 dependencies 存在：老版本只登记了
+    // bundles、把文件直接复制进 node_modules（如 dsh-task-board），需要
+    // 迁移成"plugins/ 真实目录 + junction + link: 依赖"布局，market 才显示。
     if plugin_registered(name) {
         // --- 已注册：检查是否需要修复 (needs_heal) ---
         let mut needs_heal = false;
 
-        // 3.1 检查产物是否缺失
+        // 3.1 检查产物是否缺失（junction 穿透到 store）
         if !installed.join("lib").join("index.js").exists() 
             || !installed.join("lib").join("client.js").exists() 
         {
@@ -455,17 +563,23 @@ async fn ensure_one_plugin(
         // 3.3 检查内容摘要是否变化 (作为版本检查的补充或兜底)
         if !needs_heal {
             let digest = source_digest(src);
-            if stored_digest(&installed) != Some(digest) {
+            if stored_digest(&store) != Some(digest) {
                 needs_heal = true;
             }
         }
 
         // 3.4 执行修复
         if needs_heal {
-            eprintln!("[dscoder] ensure_plugin({name}): 产物缺失/版本落后/源内容变化，正在重拷至 {}", installed.display());
-            copy_dir(src, &installed).map_err(|e| format!("同步插件失败：{e}"))?;
-            store_digest(&installed, source_digest(src));
+            eprintln!("[dscoder] ensure_plugin({name}): 产物缺失/版本落后/源内容变化，正在重拷至 {}", store.display());
+            copy_dir(src, &store).map_err(|e| format!("同步插件失败：{e}"))?;
+            store_digest(&store, source_digest(src));
         }
+
+        // 3.5 补齐布局：junction + dependencies（幂等，老安装会在这里被迁移）。
+        if ensure_plugin_link(name)? {
+            eprintln!("[dscoder] ensure_plugin({name}): created link {} -> {}", installed.display(), store.display());
+        }
+        add_plugin_to_dependencies(name)?;
 
         return Ok(());
     }
@@ -485,15 +599,19 @@ async fn ensure_one_plugin(
     .await;
     eprintln!("[dscoder] ensure_plugin({name}): status=provisioning, src={}", src.display());
 
-    // src 已由 discover_plugins 定位，直接复制即可
-    copy_dir(src, &installed).map_err(|e| format!("复制插件失败：{e}"))?;
-    store_digest(&installed, source_digest(src));
-    eprintln!("[dscoder] ensure_plugin({name}): copied to {}", installed.display());
+    // src 已由 discover_plugins 定位，直接复制到 plugins/<name>（真实目录）。
+    copy_dir(src, &store).map_err(|e| format!("复制插件失败：{e}"))?;
+    store_digest(&store, source_digest(src));
+    eprintln!("[dscoder] ensure_plugin({name}): copied to {}", store.display());
 
     // 注册到 web profile：写 dsh.profile.bundles（无需 pnpm，dsh 会从 profile/node_modules 解析）。
     ensure_profile()?;
     add_plugin_to_bundles(name)?;
-    eprintln!("[dscoder] ensure_plugin({name}): registered, bundles updated");
+    // node_modules/<name> junction → plugins/<name>，与 dsh plugin add 的布局一致。
+    ensure_plugin_link(name)?;
+    // dependencies 写入 link: 依赖，market 的「已安装」页才能看到。
+    add_plugin_to_dependencies(name)?;
+    eprintln!("[dscoder] ensure_plugin({name}): registered, bundles+dependencies updated");
 
     // 5. 校验安装结果
     if !plugin_registered(name) {
