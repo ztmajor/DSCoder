@@ -265,6 +265,12 @@ export default {
         peak:   { inputCacheHit: 0.10, inputCacheMiss: 3.0, output: 9.0 },
         offpeak:{ inputCacheHit: 0.05, inputCacheMiss: 1.5, output: 4.5 },
       },
+      // 视觉实验版：deepseek-v4-flash 的多模态变体，价格按 flash 计价
+      'deepseek-v4-flash-vision-exp': {
+        currency: 'CNY', mode: 'peak-valley',
+        peak:   { inputCacheHit: 0.10, inputCacheMiss: 3.0, output: 9.0 },
+        offpeak:{ inputCacheHit: 0.05, inputCacheMiss: 1.5, output: 4.5 },
+      },
       'deepseek-v4-pro': {
         currency: 'CNY', mode: 'peak-valley',
         peak:   { inputCacheHit: 0.30, inputCacheMiss: 9.0, output: 27.0 },
