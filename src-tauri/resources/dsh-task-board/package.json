@@ -1,0 +1,46 @@
+{
+  "name": "dsh-task-board",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness 任务看板插件：五列看板管理任务，新建任务可自定义定时执行（只执行一次 / 每天执行 / 执行指定次数），每次执行新建独立 DSH 会话并发送任务文本；Host 权威账本持久化，关闭窗口仍照常执行。",
+  "keywords": [
+    "deepseek",
+    "deepseek-harness",
+    "dsh",
+    "dsh-task-board",
+    "task-board",
+    "kanban",
+    "scheduler"
+  ],
+  "author": "DSCoder",
+  "license": "MIT",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-connection"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "react": "^18.0.0"
+  }
+}

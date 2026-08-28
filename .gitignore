@@ -22,6 +22,7 @@ src-tauri/resources/runtime/
 .vscode
 !.vscode/extensions.json
 .idea
+.github
 .DS_Store
 *.suo
 *.ntvs*

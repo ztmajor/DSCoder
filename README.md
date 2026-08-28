@@ -33,25 +33,15 @@ DSCoder 是一个 Tauri 2（Rust）桌面壳：把 DeepSeek Harness（dsh）作�
 - **配置与凭证**：完全交给官方 UI，写入 `$DSH_HOME` 下的 `settings.yaml` 与 `.credentials.yaml`。
 - **自动更新**：后台检查 GitHub Releases，原生对话框确认后下载安装并重启。
 
-## 项目结构
-
-```
-src-tauri/
-  src/                 Rust 后端（进程监督、供给、代理、路径解析）
-  resources/           内置 dsh 插件（存在即注册）
-    dsh-tabs-terminal/
-    dsh-bottom-info-bar/
-    dsh-local-git/
-    dsh-ui-tweaks/
-  tauri.conf.json      Tauri 配置
-dist/                  启动占位页（内核就绪后跳转到官方 UI）
-docs/                  设计与分析文档
-scripts/               构建/发布脚本（预置运行时、生成 updater 清单）
-```
-
 ## 构建与发布
 
 自包含打包与 GitHub Releases 自动更新，详见 [BUILD.md](BUILD.md)。
+
+## 更新计划
+
+1. 优化task_board侧边栏收起动画
+2. 外观切换会导致顶部按钮（比如：切换文件树）可见度下降
+3. 增加非线性会话轨迹功能
 
 ## 感谢
 

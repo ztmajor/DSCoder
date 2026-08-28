@@ -1,0 +1,6 @@
+# dsh-task-board bundle patch: mounts the plugin into a profile layer stack.
+# The plugin row id is 'dsh-task-board' — users may override its behavior in
+# their profile's cordis.patch.yml with a row carrying the same id.
+- insert:
+    - id: dsh-task-board
+      name: 'dsh-task-board'

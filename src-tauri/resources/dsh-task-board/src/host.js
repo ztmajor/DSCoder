@@ -1,0 +1,1860 @@
+// dsh-task-board — host half（静态 bundle 形态）
+// 业务：Host 权威任务账本（五列看板任务）+ 定时执行（once/daily/interval）+ 真实 DSH 会话执行。
+// 执行链路：每次运行新建独立 DSH 会话（sessions.create → rename → 可选 /permission → sessions.prompt），
+//          等价于「预先输入一段文本 + 定时回车发送」；5s 轮询结算 turn/end。
+// 持久化：$DSH_HOME/task-board/ledger-v2.json（可用 DSH_TASK_BOARD_DATA_DIR 覆盖目录），原子写 + 进程锁。
+// RPC：webServer HTTP 路由 /api/task-board/{state|options|action}（JSON 进出，同源防护）。
+// 依赖：apiProxy / agents / commands / webServer（ctx.inject 等待，web profile 必然存在）。
+import { chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { spawn, spawnSync } from 'node:child_process'
+import { createHash, randomUUID } from 'node:crypto'
+import { homedir } from 'node:os'
+import { dirname, join, win32 } from 'node:path'
+
+// ---------- 常量 ----------
+const ROUTE_PREFIX = '/api/task-board'
+const SCHEMA_VERSION = 2
+const EXECUTION_HISTORY_LIMIT = 20
+const MAX_REQUEST_CACHE = 256
+const ACTION_LIMIT = 64 * 1024
+const SESSION_POLL_MS = 5_000
+const SCHEDULE_TICK_MS = 15_000
+const RESUME_GAP_MS = SCHEDULE_TICK_MS + 15_000
+
+const TASK_PERMISSIONS = ['read-only', 'workspace-write', 'danger-full-access']
+const ALL_STATUSES = ['backlog', 'todo', 'running', 'done', 'failed']
+const MANUAL_STATUSES = ['backlog', 'todo']
+const SCHEDULE_MODES = ['once', 'daily', 'interval']
+const INTERVAL_UNITS = ['minute', 'hour', 'day', 'month']
+const DAILY_REPEATS = ['infinite', 'count']
+const MINUTE_MS = 60_000
+const HOUR_MS = 3_600_000
+const DAY_MS = 86_400_000
+const MAX_INTERVAL_MS = 365 * DAY_MS // 循环间隔最大 1 年
+const HANG_TIMEOUT_MS = 12 * 60 * 60 * 1000 // 等待人工操作（提问/审批）最长 12h，超时自动结算
+
+// 模型与推理等级（映射到 DSH 的 sessions.selectModel：provider=deepseek-official）
+const PROVIDER = 'deepseek-official'
+const MODEL_KINDS = ['pro', 'flash']
+const MODEL_IDS = { flash: 'deepseek-v4-flash', pro: 'deepseek-v4-pro' }
+const REASONING_LEVELS = ['off', 'low', 'high', 'max']
+const DEFAULT_MODEL = 'flash'
+const DEFAULT_REASONING = 'off'
+
+// 新建任务配置记忆（持久化于 last-config.json，随每次新建任务自动更新；重启后仍保留）。
+// 标题/描述/任务文本/工作区不记忆；模型、推理、预设、权限、定时执行继承上一次配置。
+const DEFAULT_LAST_CONFIG = {
+  mode: 'standard',      // agent 预设：标准模式
+  model: DEFAULT_MODEL,  // flash
+  reasoning: DEFAULT_REASONING, // off
+  permission: 'workspace-write', // 工作区可写
+  scheduleEnabled: false,
+  scheduleMode: 'once',
+  scheduleTime: '12:00',
+  scheduleCount: 1,
+  scheduleRepeat: 'infinite',
+  scheduleInterval: 10,
+  scheduleIntervalUnit: 'minute',
+}
+
+// ---------- 路径 ----------
+function dataDir() {
+  const override = process.env.DSH_TASK_BOARD_DATA_DIR
+  if (override && override.trim() !== '') return override.trim()
+  const home = process.env.DSH_HOME && process.env.DSH_HOME.trim() !== '' ? process.env.DSH_HOME.trim() : join(homedir(), '.dsh')
+  return join(home, 'task-board')
+}
+
+// ---------- 工具 ----------
+function timeZone() {
+  try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'local' } catch { return 'local' }
+}
+
+function cloneTasks(tasks) {
+  return JSON.parse(JSON.stringify(tasks))
+}
+
+function uuid() {
+  return randomUUID()
+}
+
+function hasOpenExecution(task) {
+  return task.executions.some((e) => e.endedAt === undefined)
+}
+
+function normalizeTargetId(value) {
+  const trimmed = typeof value === 'string' ? value.trim() : ''
+  return trimmed === '' ? undefined : trimmed
+}
+
+function isTaskPermission(value) {
+  return typeof value === 'string' && TASK_PERMISSIONS.indexOf(value) !== -1
+}
+
+function isTaskStatus(value) {
+  return typeof value === 'string' && ALL_STATUSES.indexOf(value) !== -1
+}
+
+function canMoveManually(from, to) {
+  return from !== 'running' && MANUAL_STATUSES.indexOf(to) !== -1
+}
+
+// 任务是否可参与调度：未归档且非「待规划」（待规划即使有定时也不执行）。
+function isSchedulableTask(task) {
+  return task.archivedAt === undefined && task.status !== 'backlog'
+}
+
+// ---------- 定时调度（时间点 + 重复规则：once / daily / interval） ----------
+// 时间采用 24h「HH:MM」本地墙上时钟语义；nextRunAt 始终严格晚于 from。
+function parseTime(hhmm) {
+  if (typeof hhmm !== 'string') return null
+  const m = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(hhmm.trim())
+  if (!m) return null
+  return { h: Number(m[1]), min: Number(m[2]) }
+}
+
+function nextOccurrence(hhmm, fromMs) {
+  const t = parseTime(hhmm)
+  if (!t) return undefined
+  const from = new Date(fromMs)
+  let candidate = new Date(from.getFullYear(), from.getMonth(), from.getDate(), t.h, t.min, 0, 0)
+  if (candidate.getTime() <= fromMs) {
+    candidate = new Date(from.getFullYear(), from.getMonth(), from.getDate() + 1, t.h, t.min, 0, 0)
+  }
+  return candidate.getTime()
+}
+
+// 循环执行：从 from 起推 interval 个 unit（分钟/小时/天/月，月按日历推进）。
+function nextIntervalOccurrence(interval, unit, fromMs) {
+  if (!Number.isInteger(interval) || interval < 1) return undefined
+  if (unit === 'minute') return fromMs + interval * MINUTE_MS
+  if (unit === 'hour') return fromMs + interval * HOUR_MS
+  if (unit === 'day') return fromMs + interval * DAY_MS
+  if (unit === 'month') {
+    // 日历月推进 + 月末截断：1月31日 + 1月 → 2月28日（2025），而非 JS setMonth 的溢出到 3 月。
+    const next = new Date(fromMs)
+    const day = next.getDate()
+    next.setDate(1)
+    next.setMonth(next.getMonth() + interval)
+    const lastDay = new Date(next.getFullYear(), next.getMonth() + 1, 0).getDate()
+    next.setDate(Math.min(day, lastDay))
+    return next.getTime()
+  }
+  return undefined
+}
+
+// 循环间隔合法性：单位受支持、数值 ≥ 1、总周期 ≤ 1 年（month 上限 12）。
+function isValidInterval(interval, unit) {
+  if (!Number.isInteger(interval) || interval < 1) return false
+  if (unit === 'month') return interval <= 12
+  if (unit === 'minute') return interval * MINUTE_MS <= MAX_INTERVAL_MS
+  if (unit === 'hour') return interval * HOUR_MS <= MAX_INTERVAL_MS
+  if (unit === 'day') return interval * DAY_MS <= MAX_INTERVAL_MS
+  return false
+}
+
+// 启用状态下计算 nextRunAt；daily+count 模式在缺失 remainingRuns 时按 totalRuns 初始化。
+function armSchedule(schedule, now) {
+  if (!schedule.enabled) return { ...schedule, nextRunAt: undefined }
+  const next = schedule.mode === 'interval'
+    ? nextIntervalOccurrence(schedule.interval, schedule.intervalUnit, now)
+    : nextOccurrence(schedule.time, now)
+  if (next === undefined) return { ...schedule, enabled: false, nextRunAt: undefined }
+  const out = { ...schedule, nextRunAt: next }
+  if (schedule.mode === 'daily' && schedule.repeat === 'count' && out.remainingRuns === undefined) {
+    out.remainingRuns = schedule.totalRuns || 1
+  }
+  return out
+}
+
+// 触发或跳过之后滚动规则。fired=true 表示本次确实执行（daily+count 递减；once 停用）。
+// 错过期间（Host 停机）的发生点一律跳过且不计数：only roll forward。
+function rollSchedule(schedule, now, fired) {
+  const lastTriggeredAt = fired ? now : schedule.lastTriggeredAt
+  if (schedule.mode === 'once') {
+    return { ...schedule, enabled: false, nextRunAt: undefined, lastTriggeredAt }
+  }
+  if (schedule.mode === 'interval') {
+    const next = nextIntervalOccurrence(schedule.interval, schedule.intervalUnit, now)
+    return { ...schedule, nextRunAt: next, lastTriggeredAt }
+  }
+  // daily
+  if (schedule.repeat === 'count') {
+    let remaining = schedule.remainingRuns ?? schedule.totalRuns ?? 1
+    if (fired) remaining -= 1
+    if (remaining <= 0) {
+      return { ...schedule, enabled: false, nextRunAt: undefined, remainingRuns: 0, lastTriggeredAt }
+    }
+    return { ...schedule, remainingRuns: remaining, nextRunAt: nextOccurrence(schedule.time, now), lastTriggeredAt }
+  }
+  // daily + infinite
+  return { ...schedule, nextRunAt: nextOccurrence(schedule.time, now), lastTriggeredAt }
+}
+
+// ---------- 任务领域模型（纯函数，Host/Client 语义一致） ----------
+function retainRecentExecutions(executions) {
+  if (executions.length <= EXECUTION_HISTORY_LIMIT) return [...executions]
+  const open = executions.filter((e) => e.endedAt === undefined)
+  const settled = executions.filter((e) => e.endedAt !== undefined)
+  const keepSettled = Math.max(EXECUTION_HISTORY_LIMIT - open.length, 0)
+  return [...settled.slice(Math.max(settled.length - keepSettled, 0)), ...open]
+}
+
+function createTask(input, now, id) {
+  return {
+    id,
+    title: input.title.trim(),
+    description: input.description.trim(),
+    prompt: input.prompt.trim(),
+    status: input.status === 'backlog' ? 'backlog' : 'todo',
+    createdAt: now,
+    updatedAt: now,
+    executions: [],
+    workspaceId: normalizeTargetId(input.workspaceId),
+    mode: normalizeTargetId(input.mode),
+    permission: isTaskPermission(input.permission) ? input.permission : undefined,
+    model: MODEL_KINDS.indexOf(input.model) !== -1 ? input.model : DEFAULT_MODEL,
+    reasoning: REASONING_LEVELS.indexOf(input.reasoning) !== -1 ? input.reasoning : DEFAULT_REASONING,
+  }
+}
+
+function withStatus(task, status, now) {
+  return { ...task, status, updatedAt: now }
+}
+
+function startExecution(task, now, executionId) {
+  const execution = {
+    id: executionId,
+    sessionId: undefined,
+    startedAt: now,
+    endedAt: undefined,
+    result: undefined,
+    error: undefined,
+  }
+  return {
+    task: { ...task, status: 'running', updatedAt: now, executions: retainRecentExecutions([...task.executions, execution]) },
+    execution,
+  }
+}
+
+function settleExecution(task, executionId, outcome, now, error, failKind) {
+  const index = task.executions.findIndex((e) => e.id === executionId)
+  if (index === -1) return task
+  const execution = task.executions[index]
+  if (execution.endedAt !== undefined) return task
+  const settled = { ...execution, endedAt: now, result: outcome, error, ...(failKind === undefined ? {} : { failKind }) }
+  const executions = [...task.executions]
+  executions[index] = settled
+  // 有持续调度（每天 / 固定次数未耗尽 / 循环）的任务：本轮完成或失败后回到「待执行」等待下次调度，
+  // 不进已完成/失败列；调度停用（once 已触发、次数耗尽、手动关闭）后按结果正常结算。
+  const hasRecurringSchedule = task.schedule !== undefined && task.schedule.enabled === true
+  const status = hasRecurringSchedule ? 'todo'
+    : outcome === 'succeeded' ? 'done'
+      : outcome === 'failed' ? 'failed'
+        : task.status === 'running' ? 'todo' : task.status
+  return { ...task, status, updatedAt: now, executions }
+}
+
+const TASK_CONTENT_FIELDS = ['title', 'description', 'prompt']
+
+function hasContentPatch(patch) {
+  return TASK_CONTENT_FIELDS.some((f) => f in patch)
+}
+
+function canEditTaskContent(task) {
+  return task.archivedAt === undefined && task.status !== 'running' && task.executions.length === 0
+}
+
+function normalizePermission(current, value) {
+  if (value === undefined) return undefined
+  return isTaskPermission(value) ? value : current
+}
+
+// ---------- 原子写 ----------
+function writeJsonAtomic(file, data) {
+  mkdirSync(dirname(file), { recursive: true })
+  const tmp = `${file}.tmp-${process.pid}`
+  let fd
+  try {
+    fd = openSync(tmp, 'w', 0o600)
+    writeFileSync(fd, JSON.stringify(data, null, 2), { encoding: 'utf8' })
+    fsyncSync(fd)
+    closeSync(fd)
+    fd = undefined
+    try { chmodSync(tmp, 0o600) } catch { /* Windows ACLs own access */ }
+    renameSync(tmp, file)
+    try {
+      const dirFd = openSync(dirname(file), 'r')
+      try { fsyncSync(dirFd) } finally { closeSync(dirFd) }
+    } catch {
+      // Windows 不支持 fsync 目录句柄；rename 本身仍原子。
+    }
+  } catch (err) {
+    if (fd !== undefined) closeSync(fd)
+    try { unlinkSync(tmp) } catch { /* best-effort */ }
+    throw err
+  }
+}
+
+function isPidAlive(pid) {
+  try { process.kill(pid, 0); return true } catch (err) { return err.code !== 'ESRCH' }
+}
+
+function acquireLock(lockFile, token) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const fd = openSync(lockFile, 'wx', 0o600)
+      writeFileSync(fd, JSON.stringify({ pid: process.pid, token }), { encoding: 'utf8' })
+      fsyncSync(fd)
+      try { chmodSync(lockFile, 0o600) } catch { /* Windows ACLs own access */ }
+      return fd
+    } catch (err) {
+      if (err.code !== 'EEXIST') throw err
+      let pid
+      try { pid = JSON.parse(readFileSync(lockFile, 'utf8')).pid } catch {
+        throw new Error(`task-board ledger lock is unreadable: ${lockFile}; 若为异常退出残留且无其它 DSH host 在运行，请手动删除后重试`)
+      }
+      if (Number.isInteger(pid) && pid > 0 && isPidAlive(pid)) {
+        throw new Error(`task-board ledger is already owned by process ${pid}`)
+      }
+      try { unlinkSync(lockFile) } catch (e) { if (e.code !== 'ENOENT') throw e }
+    }
+  }
+  throw new Error(`task-board ledger lock could not be acquired: ${lockFile}`)
+}
+
+// ---------- 账本 ----------
+class Ledger {
+  constructor(dir = dataDir()) {
+    mkdirSync(dir, { recursive: true })
+    this.dir = dir
+    this.file = join(dir, 'ledger-v2.json')
+    this.lockFile = join(dir, 'ledger-v2.lock')
+    this.listeners = new Set()
+    this.requestCache = new Map()
+    this.lockToken = randomUUID()
+    this.lockFd = acquireLock(this.lockFile, this.lockToken)
+    this.document = this.load()
+    for (const request of this.document.recentRequests) {
+      this.requestCache.set(request.requestId, { fingerprint: request.fingerprint })
+    }
+    this.repairSchedules()
+    this.reconcileInterruptedStarts()
+    this.commit(false)
+  }
+
+  load() {
+    const existed = existsSync(this.file)
+    try {
+      const parsed = JSON.parse(readFileSync(this.file, 'utf8'))
+      if (parsed.schemaVersion !== SCHEMA_VERSION || !Array.isArray(parsed.tasks)) throw new Error('unsupported ledger schema')
+      const tasks = this.parseTasks(parsed.tasks)
+      const invalid = tasks.filter((t) => {
+        if (!t.schedule || !t.schedule.enabled) return false
+        return t.schedule.mode === 'interval'
+          ? !isValidInterval(t.schedule.interval, t.schedule.intervalUnit)
+          : !parseTime(t.schedule.time)
+      }).map((t) => t.id)
+      return {
+        schemaVersion: SCHEMA_VERSION,
+        revision: Number.isSafeInteger(parsed.revision) && parsed.revision >= 0 ? parsed.revision : 0,
+        tasks,
+        scheduler: {
+          timeZone: timeZone(),
+          ledgerId: typeof parsed.scheduler?.ledgerId === 'string' && parsed.scheduler.ledgerId !== '' ? parsed.scheduler.ledgerId : randomUUID(),
+          ...(invalid.length > 0 ? { error: `invalid schedule disabled for task(s): ${invalid.join(', ')}` } : {}),
+          ...(typeof parsed.scheduler?.error === 'string' ? { error: parsed.scheduler.error } : {}),
+        },
+        recentRequests: Array.isArray(parsed.recentRequests)
+          ? parsed.recentRequests.filter((e) => e && typeof e.requestId === 'string' && typeof e.fingerprint === 'string').slice(-MAX_REQUEST_CACHE)
+          : [],
+      }
+    } catch (err) {
+      if (existed) renameSync(this.file, `${this.file}.corrupt-${Date.now()}-${process.pid}-${randomUUID()}`)
+      mkdirSync(this.dir, { recursive: true })
+      return {
+        schemaVersion: SCHEMA_VERSION,
+        revision: 0,
+        tasks: [],
+        scheduler: { timeZone: timeZone(), ledgerId: randomUUID(), ...(existed ? { error: `corrupt ledger was quarantined: ${err && err.message ? err.message : String(err)}` } : {}) },
+        recentRequests: [],
+      }
+    }
+  }
+
+  parseTasks(values) {
+    const out = []
+    for (const row of values) {
+      if (typeof row !== 'object' || row === null) continue
+      if (typeof row.id !== 'string' || row.id === '') continue
+      if (typeof row.title !== 'string' || typeof row.description !== 'string' || typeof row.prompt !== 'string') continue
+      if (typeof row.createdAt !== 'number' || typeof row.updatedAt !== 'number') continue
+      if (!Array.isArray(row.executions)) continue
+      const executions = []
+      let okExec = true
+      for (const e of row.executions) {
+        if (typeof e !== 'object' || e === null || typeof e.id !== 'string' || typeof e.startedAt !== 'number') { okExec = false; break }
+        executions.push({
+          id: e.id,
+          sessionId: typeof e.sessionId === 'string' ? e.sessionId : undefined,
+          startedAt: e.startedAt,
+          endedAt: typeof e.endedAt === 'number' ? e.endedAt : undefined,
+          result: e.result === 'succeeded' || e.result === 'failed' || e.result === 'cancelled' ? e.result : undefined,
+          error: typeof e.error === 'string' ? e.error : undefined,
+          failKind: e.failKind === 'abnormal' || e.failKind === 'timeout' || e.failKind === 'unknown' ? e.failKind : undefined,
+        })
+      }
+      if (!okExec) continue
+      const task = {
+        id: row.id,
+        title: row.title,
+        description: row.description,
+        prompt: row.prompt,
+        status: isTaskStatus(row.status) ? row.status : 'todo',
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+        executions: retainRecentExecutions(executions),
+        workspaceId: normalizeTargetId(row.workspaceId),
+        mode: normalizeTargetId(row.mode),
+        permission: isTaskPermission(row.permission) ? row.permission : undefined,
+        model: MODEL_KINDS.indexOf(row.model) !== -1 ? row.model : DEFAULT_MODEL,
+        reasoning: REASONING_LEVELS.indexOf(row.reasoning) !== -1 ? row.reasoning : DEFAULT_REASONING,
+        archivedAt: typeof row.archivedAt === 'number' && Number.isFinite(row.archivedAt) ? row.archivedAt : undefined,
+        archiveSeq: typeof row.archiveSeq === 'number' ? row.archiveSeq : undefined,
+      }
+      if (row.schedule && typeof row.schedule === 'object') {
+        const s = row.schedule
+        const mode = s.mode === 'times' ? 'daily' : s.mode // 旧 times 迁移为 daily+count
+        const time = String(s.time || '').trim()
+        const hasValidTime = parseTime(time) !== null
+        const hasValidInterval = isValidInterval(typeof s.interval === 'number' ? s.interval : NaN, s.intervalUnit)
+        if (SCHEDULE_MODES.indexOf(mode) !== -1 && (mode === 'interval' ? hasValidInterval : hasValidTime)) {
+          const repeat = mode === 'daily' ? (s.repeat === 'count' || s.mode === 'times' ? 'count' : 'infinite') : undefined
+          const countRuns = mode === 'daily' && repeat === 'count'
+          task.schedule = {
+            enabled: s.enabled === true,
+            mode,
+            ...(mode === 'interval' ? {} : { time }),
+            ...(mode === 'daily' ? { repeat } : {}),
+            ...(countRuns ? {
+              totalRuns: Number.isInteger(s.totalRuns) && s.totalRuns >= 1 ? s.totalRuns : undefined,
+              remainingRuns: Number.isInteger(s.remainingRuns) ? s.remainingRuns : undefined,
+            } : {}),
+            ...(mode === 'interval' ? {
+              interval: Number.isInteger(s.interval) && s.interval >= 1 ? s.interval : undefined,
+              intervalUnit: INTERVAL_UNITS.indexOf(s.intervalUnit) !== -1 ? s.intervalUnit : undefined,
+            } : {}),
+            lastTriggeredAt: typeof s.lastTriggeredAt === 'number' ? s.lastTriggeredAt : undefined,
+            nextRunAt: typeof s.nextRunAt === 'number' ? s.nextRunAt : undefined,
+          }
+        }
+      }
+      out.push(task)
+    }
+    return out
+  }
+
+  summary() {
+    return { revision: this.document.revision, scheduler: { ...this.document.scheduler } }
+  }
+
+  state() {
+    const { revision, scheduler } = this.summary()
+    return { revision, tasks: cloneTasks(this.document.tasks), scheduler }
+  }
+
+  openExecutions() {
+    const open = []
+    for (const task of this.document.tasks) {
+      for (const execution of task.executions) {
+        if (execution.endedAt !== undefined) continue
+        open.push({ taskId: task.id, executionId: execution.id, sessionId: execution.sessionId, startedAt: execution.startedAt })
+      }
+    }
+    return open
+  }
+
+  dueScheduleTaskIds(now) {
+    const due = []
+    for (const task of this.document.tasks) {
+      if (!isSchedulableTask(task)) continue
+      const s = task.schedule
+      if (!s || !s.enabled || s.nextRunAt === undefined || s.nextRunAt > now) continue
+      due.push(task.id)
+    }
+    return due
+  }
+
+  armedScheduleCount() {
+    let count = 0
+    for (const task of this.document.tasks) {
+      if (isSchedulableTask(task) && task.schedule && task.schedule.enabled === true) count += 1
+    }
+    return count
+  }
+
+  subscribe(listener) {
+    this.listeners.add(listener)
+    return () => { this.listeners.delete(listener) }
+  }
+
+  notify() {
+    for (const fn of [...this.listeners]) fn()
+  }
+
+  commit(bumpRevision = true) {
+    if (bumpRevision) this.document.revision += 1
+    writeJsonAtomic(this.file, this.document)
+    this.notify()
+  }
+
+  dispose() {
+    const fd = this.lockFd
+    if (fd === undefined) return
+    this.lockFd = undefined
+    closeSync(fd)
+    try {
+      const owner = JSON.parse(readFileSync(this.lockFile, 'utf8'))
+      if (owner.token === this.lockToken) unlinkSync(this.lockFile)
+    } catch {
+      // 缺失或被外部替换的锁不做盲目删除。
+    }
+  }
+
+  applyRequest(requestId, action) {
+    const fingerprint = createHash('sha256').update(JSON.stringify(action)).digest('hex')
+    const cached = this.requestCache.get(requestId)
+    if (cached !== undefined) {
+      if (cached.fingerprint !== fingerprint) throw new Error('request id was reused with a different action')
+      return { state: this.state() }
+    }
+    this.requestCache.set(requestId, { fingerprint })
+    while (this.requestCache.size > MAX_REQUEST_CACHE) this.requestCache.delete(this.requestCache.keys().next().value)
+    this.syncRecentRequests()
+    try {
+      return this.apply(action)
+    } catch (err) {
+      this.requestCache.delete(requestId)
+      this.syncRecentRequests()
+      throw err
+    }
+  }
+
+  syncRecentRequests() {
+    this.document.recentRequests = [...this.requestCache].map(([requestId, r]) => ({ requestId, fingerprint: r.fingerprint }))
+  }
+
+  apply(action) {
+    const now = Date.now()
+    let run
+    let cancelSessionId
+    switch (action.kind) {
+      case 'create': {
+        if (this.document.tasks.some((t) => t.id === action.id)) throw new Error('task id already exists')
+        const input = action.input
+        if (input.title.trim() === '') throw new Error('title is required')
+        let task = createTask(input, now, action.id)
+        if (input.schedule) {
+          const s = normalizeScheduleInput(input.schedule)
+          const base = { ...s, remainingRuns: undefined, lastTriggeredAt: undefined, nextRunAt: undefined }
+          task.schedule = s.enabled ? armSchedule(base, now) : base
+        }
+        this.document.tasks = [...this.document.tasks, task]
+        break
+      }
+      case 'update': {
+        const task = this.document.tasks.find((t) => t.id === action.taskId)
+        if (task === undefined) throw new Error('task not found')
+        if (task.archivedAt !== undefined) throw new Error('archived task is read-only')
+        if (hasContentPatch(action.patch) && !canEditTaskContent(task)) throw new Error('task has already been executed')
+        if ('title' in action.patch && String(action.patch.title ?? '').trim() === '') throw new Error('title is required')
+        this.document.tasks = this.document.tasks.map((t) => {
+          if (t.id !== action.taskId) return t
+          const patch = action.patch
+          const next = { ...t, ...patch, updatedAt: now }
+          for (const field of TASK_CONTENT_FIELDS) {
+            if (!(field in patch)) continue
+            const value = patch[field]
+            next[field] = value === undefined ? t[field] : String(value).trim()
+          }
+          if ('workspaceId' in patch) next.workspaceId = normalizeTargetId(patch.workspaceId)
+          if ('mode' in patch) next.mode = normalizeTargetId(patch.mode)
+          if ('permission' in patch) next.permission = normalizePermission(t.permission, patch.permission)
+          return next
+        })
+        break
+      }
+      case 'delete': {
+        const task = this.document.tasks.find((t) => t.id === action.taskId)
+        if (task === undefined) throw new Error('task not found')
+        if (task.status === 'running' || hasOpenExecution(task)) throw new Error('running task cannot be deleted')
+        this.document.tasks = this.document.tasks.filter((t) => t.id !== action.taskId)
+        break
+      }
+      case 'move': {
+        const task = this.document.tasks.find((t) => t.id === action.taskId)
+        if (task === undefined) throw new Error('task not found')
+        if (task.archivedAt !== undefined) throw new Error('archived task is read-only')
+        if (task.status === 'running' || hasOpenExecution(task)) throw new Error('running task cannot be moved')
+        if (!canMoveManually(task.status, action.status)) throw new Error('invalid manual status')
+        this.document.tasks = this.document.tasks.map((t) => {
+          if (t.id !== action.taskId) return t
+          let next = withStatus(t, action.status, now)
+          // 离开「待规划」时，若任务有启用计划，重算下次执行时间
+          if (t.status === 'backlog' && action.status !== 'backlog' && next.schedule && next.schedule.enabled) {
+            next = { ...next, schedule: armSchedule({ ...next.schedule, nextRunAt: undefined }, now) }
+          }
+          return next
+        })
+        break
+      }
+      case 'archive': {
+        let applied = false
+        const ts = Math.floor(now / 1000) * 1000 // 秒级时间戳
+        this.document.tasks = this.document.tasks.map((t) => {
+          if (t.id !== action.taskId || t.archivedAt !== undefined) return t
+          if (t.status === 'running' || hasOpenExecution(t)) return t
+          applied = true
+          const schedule = t.schedule === undefined ? undefined : { ...t.schedule, enabled: false, nextRunAt: undefined }
+          return { ...t, ...(schedule === undefined ? {} : { schedule }), archivedAt: ts, archiveSeq: action.seq, updatedAt: now }
+        })
+        if (!applied) throw new Error('task cannot be archived')
+        break
+      }
+      case 'restore': {
+        let applied = false
+        this.document.tasks = this.document.tasks.map((t) => {
+          if (t.id !== action.taskId || t.archivedAt === undefined) return t
+          applied = true
+          const { archivedAt, archiveSeq, ...rest } = t
+          return { ...rest, updatedAt: now }
+        })
+        if (!applied) throw new Error('task is not archived')
+        break
+      }
+      case 'set-schedule': {
+        const task = this.document.tasks.find((t) => t.id === action.taskId)
+        if (task === undefined) throw new Error('task not found')
+        if (task.archivedAt !== undefined) throw new Error('archived task is read-only')
+        const current = task.schedule || { enabled: false, mode: 'daily', time: '09:00', repeat: 'infinite', totalRuns: undefined, interval: undefined, intervalUnit: undefined, remainingRuns: undefined, lastTriggeredAt: undefined, nextRunAt: undefined }
+        const next = normalizeScheduleInput({
+          enabled: action.patch.enabled !== undefined ? action.patch.enabled === true : current.enabled,
+          mode: action.patch.mode !== undefined ? action.patch.mode : current.mode,
+          time: action.patch.time !== undefined ? String(action.patch.time).trim() : current.time,
+          repeat: action.patch.repeat !== undefined ? action.patch.repeat : current.repeat,
+          totalRuns: action.patch.totalRuns !== undefined ? Number(action.patch.totalRuns) : current.totalRuns,
+          interval: action.patch.interval !== undefined ? Number(action.patch.interval) : current.interval,
+          intervalUnit: action.patch.intervalUnit !== undefined ? action.patch.intervalUnit : current.intervalUnit,
+        })
+        const base = { ...next, remainingRuns: undefined, lastTriggeredAt: current.lastTriggeredAt, nextRunAt: undefined }
+        const schedule = base.enabled ? armSchedule(base, now) : base
+        this.document.tasks = this.document.tasks.map((t) => t.id === action.taskId ? { ...t, schedule, updatedAt: now } : t)
+        break
+      }
+      case 'cancel': {
+        const task = this.document.tasks.find((t) => t.id === action.taskId)
+        if (task === undefined || task.archivedAt !== undefined) throw new Error('task is missing or archived')
+        const execution = task.executions.find((e) => e.endedAt === undefined)
+        if (execution === undefined) throw new Error('task is not running')
+        this.document.tasks = this.document.tasks.map((t) => t.id === action.taskId
+          ? settleExecution(t, execution.id, 'cancelled', now, 'terminated by user')
+          : t)
+        cancelSessionId = execution.sessionId
+        break
+      }
+      case 'rerun':
+      case 'run': {
+        const task = this.document.tasks.find((t) => t.id === action.taskId)
+        if (task === undefined || task.archivedAt !== undefined) throw new Error('task is missing or archived')
+        if (task.status === 'running' || hasOpenExecution(task)) throw new Error('task is already running')
+        const base = action.kind === 'rerun' ? withStatus(task, 'todo', now) : task
+        run = startExecution(base, now, uuid())
+        // 手动执行同样滚动调度（与定时触发一致）：once 停用进已完成、count 次数递减（到 0 进已完成）、daily/interval 继续
+        const schedule = run.task.schedule === undefined ? undefined : rollSchedule(run.task.schedule, now, true)
+        const settledTask = schedule === undefined ? run.task : { ...run.task, schedule }
+        this.document.tasks = this.document.tasks.map((t) => t.id === task.id ? settledTask : t)
+        break
+      }
+      default:
+        throw new Error('unknown action')
+    }
+    this.commit()
+    return { state: this.state(), ...(run === undefined ? {} : { run }), ...(cancelSessionId === undefined ? {} : { cancelSessionId }) }
+  }
+
+  openScheduled(taskId, now) {
+    const task = this.document.tasks.find((t) => t.id === taskId)
+    if (task === undefined || !isSchedulableTask(task)) return undefined
+    if (task.status === 'running' || hasOpenExecution(task)) {
+      this.document.tasks = this.document.tasks.map((t) => t.id === taskId ? { ...t, schedule: rollSchedule(t.schedule, now, false), updatedAt: now } : t)
+      this.commit()
+      return undefined
+    }
+    const opened = startExecution(task, now, uuid())
+    const rolled = rollSchedule(opened.task.schedule, now, true)
+    const settled = { ...opened.task, schedule: rolled }
+    this.document.tasks = this.document.tasks.map((t) => t.id === taskId ? settled : t)
+    this.commit()
+    return { task: settled, execution: opened.execution }
+  }
+
+  skipMissed(now) {
+    let changed = false
+    this.document.tasks = this.document.tasks.map((t) => {
+      if (!isSchedulableTask(t)) return t
+      const s = t.schedule
+      if (!s || !s.enabled || s.nextRunAt === undefined || s.nextRunAt > now) return t
+      changed = true
+      return { ...t, schedule: rollSchedule(s, now, false), updatedAt: now }
+    })
+    if (changed) this.commit()
+  }
+
+  attachSession(taskId, executionId, sessionId) {
+    const now = Date.now()
+    this.document.tasks = this.document.tasks.map((t) => t.id !== taskId ? t : {
+      ...t,
+      updatedAt: now,
+      executions: t.executions.map((e) => e.id === executionId ? { ...e, sessionId } : e),
+    })
+    this.commit()
+  }
+
+  settle(taskId, executionId, outcome, error, failKind) {
+    this.document.tasks = this.document.tasks.map((t) => t.id === taskId ? settleExecution(t, executionId, outcome, Date.now(), error, failKind) : t)
+    this.commit()
+  }
+
+  repairSchedules() {
+    const now = Date.now()
+    let changed = false
+    this.document.tasks = this.document.tasks.map((t) => {
+      if (!isSchedulableTask(t)) return t
+      const s = t.schedule
+      if (!s || !s.enabled) return t
+      const valid = s.mode === 'interval' ? isValidInterval(s.interval, s.intervalUnit) : parseTime(s.time) !== null
+      if (!valid) {
+        changed = true
+        return { ...t, schedule: { ...s, enabled: false, nextRunAt: undefined }, updatedAt: now }
+      }
+      if (s.nextRunAt === undefined) {
+        changed = true
+        const next = s.mode === 'interval' ? nextIntervalOccurrence(s.interval, s.intervalUnit, now) : nextOccurrence(s.time, now)
+        return { ...t, schedule: { ...s, nextRunAt: next }, updatedAt: now }
+      }
+      return t
+    })
+    if (changed) this.commit()
+  }
+
+  reconcileInterruptedStarts() {
+    const now = Date.now()
+    let changed = false
+    this.document.tasks = this.document.tasks.map((t) => {
+      if (t.status !== 'running') return t
+      const execution = t.executions[t.executions.length - 1]
+      if (execution === undefined || execution.endedAt !== undefined || execution.sessionId !== undefined) return t
+      changed = true
+      return settleExecution(t, execution.id, 'failed', now, 'host restarted before the execution session was recorded', 'abnormal')
+    })
+    if (changed) this.commit()
+  }
+}
+
+// ---------- 执行 runner ----------
+function rpcRequest(payload) {
+  return { rpcId: `dsh-task-board-${randomUUID()}`, payload }
+}
+
+function rpcFailure(err) {
+  return new Error(`${err && err.code ? err.code : 'error'}: ${err && err.message ? err.message : String(err)}`)
+}
+
+class SessionLaunchError extends Error {
+  constructor(sessionId, cause) {
+    super(`execution session ${sessionId} failed during launch: ${cause instanceof Error ? cause.message : String(cause)}`)
+    this.name = 'SessionLaunchError'
+    this.sessionId = sessionId
+  }
+}
+
+// 将 turn/end 的非 completed 收尾原因转成失败文案（白名单语义：只有 completed 算成功）。
+function turnEndFailure(kind, reason) {
+  if (kind === 'error') {
+    const failure = reason && typeof reason === 'object' ? reason.error : undefined
+    const message = failure && typeof failure === 'object' && typeof failure.message === 'string' ? failure.message : undefined
+    return message || 'agent turn ended with an error'
+  }
+  if (kind === 'aborted') {
+    const cause = reason && typeof reason === 'object' && reason.reason && typeof reason.reason === 'object' ? reason.reason : undefined
+    const causeKind = cause && typeof cause.kind === 'string' ? cause.kind : 'unknown'
+    return `agent turn was aborted (${causeKind})`
+  }
+  if (kind === 'interrupted') return 'agent turn was interrupted by a host restart or crash'
+  if (kind === 'blocked') return 'agent turn was blocked'
+  if (kind === 'max-tokens') return 'agent turn reached the output token limit'
+  return `agent turn ended unexpectedly (reason: ${kind || 'unknown'})`
+}
+
+class Runner {
+  constructor(api, agents, commands) {
+    this.api = api
+    this.agents = agents
+    this.commands = commands
+  }
+
+  async launch(task) {
+    if (task.workspaceId !== undefined) {
+      const workspaces = await this.api.workspace.list(rpcRequest({}))
+      if (!workspaces.result.ok) throw rpcFailure(workspaces.result.error)
+      if (!workspaces.result.value.items.some((item) => item.workspaceId === task.workspaceId)) {
+        throw new Error(`workspace not found: ${task.workspaceId}`)
+      }
+    }
+    if (task.mode !== undefined) {
+      const presets = await this.api.agentPresets.list(rpcRequest({}))
+      if (!presets.result.ok) throw rpcFailure(presets.result.error)
+      const preset = presets.result.value.presets.find((item) => item.id === task.mode)
+      if (preset === undefined) throw new Error(`agent preset not found: ${task.mode}`)
+      if (preset.broken !== undefined) throw new Error(`agent preset is unavailable: ${preset.broken}`)
+    }
+    const created = await this.api.sessions.create(rpcRequest({
+      ...(task.workspaceId === undefined ? {} : { workspaceId: task.workspaceId }),
+      ...(task.mode === undefined ? {} : { agentPreset: task.mode }),
+    }))
+    if (!created.result.ok) throw rpcFailure(created.result.error)
+    const sessionId = created.result.value.sessionId
+    try {
+      const renamed = await this.api.sessions.rename(rpcRequest({ sessionId, title: task.title }))
+      if (!renamed.result.ok) throw rpcFailure(renamed.result.error)
+      if (task.permission !== undefined) {
+        if (!this.commands || !this.agents) throw new Error('permission command dispatcher is unavailable')
+        const agent = this.agents.get(sessionId)
+        if (agent === undefined) throw new Error(`execution session ${sessionId} is not available`)
+        const exec = await this.commands.execute(agent, `/permission ${task.permission}`, [], AbortSignal.timeout(30_000))
+        const command = exec && exec.result
+        if (command === undefined) throw new Error('permission command was not acknowledged')
+        if (command.kind !== 'success') throw new Error(command.text || 'permission command failed')
+      }
+      // 应用模型 + 推理等级（pro/flash 与 off/low/high/max）
+      const modelId = MODEL_IDS[task.model] || MODEL_IDS[DEFAULT_MODEL]
+      const reasoning = REASONING_LEVELS.indexOf(task.reasoning) !== -1 ? task.reasoning : DEFAULT_REASONING
+      const selected = await this.api.sessions.selectModel(rpcRequest({
+        sessionId,
+        provider: PROVIDER,
+        model: modelId,
+        reasoningEffort: reasoning,
+      }))
+      if (!selected.result.ok) throw rpcFailure(selected.result.error)
+      const prompt = await this.api.sessions.prompt(rpcRequest({
+        sessionId,
+        mode: 'queue',
+        content: [{ type: 'text', text: task.prompt !== '' ? task.prompt : task.title }],
+      }))
+      if (!prompt.result.ok) throw rpcFailure(prompt.result.error)
+    } catch (err) {
+      throw new SessionLaunchError(sessionId, err)
+    }
+    return sessionId
+  }
+
+  async listRunning() {
+    try {
+      const response = await this.api.sessions.list(rpcRequest({}))
+      return response.result.ok ? { known: true, items: response.result.value.items } : { known: false }
+    } catch {
+      return { known: false }
+    }
+  }
+
+  async cancelSession(sessionId) {
+    if (!sessionId) return
+    try {
+      await this.api.sessions.cancel(rpcRequest({ sessionId }))
+    } catch (err) {
+      console.error('[dsh-task-board] cancel session failed', err)
+    }
+  }
+
+  // 从事件列表计算是否等待人工：审批（approval/asked 无配对 decided）或选择题（ask_user_question 无配对 tool/result）。
+  awaitingFromEvents(entries) {
+    const askedIds = new Set()
+    const decidedIds = new Set()
+    const questionCalls = new Map()
+    const questionResults = new Set()
+    for (const entry of entries) {
+      const ev = entry && entry.event
+      if (!ev || !ev.data || typeof ev.data !== 'object') continue
+      const data = ev.data
+      if (ev.type === 'approval/asked' && typeof data.id === 'string') {
+        askedIds.add(data.id)
+      } else if (ev.type === 'approval/decided' && typeof data.id === 'string') {
+        decidedIds.add(data.id)
+      } else if (ev.type === 'tool/call' && data.name === 'ask_user_question' && typeof data.callId === 'string') {
+        questionCalls.set(data.callId, true)
+      } else if (ev.type === 'tool/result' && data.message && typeof data.message === 'object') {
+        const callId = data.message.callId || (Array.isArray(data.message.content)
+          ? data.message.content.find((b) => b && b.type === 'tool-result' && typeof b.toolCallId === 'string')?.toolCallId
+          : undefined)
+        if (typeof callId === 'string') questionResults.add(callId)
+      }
+    }
+    for (const id of askedIds) {
+      if (!decidedIds.has(id)) return { reason: 'approval' }
+    }
+    for (const callId of questionCalls.keys()) {
+      if (!questionResults.has(callId)) return { reason: 'question' }
+    }
+    return undefined
+  }
+
+  // 统一轮询：一次拉取同时完成「等待人工」检测与「结算」检测。
+  // running=true 只拉一页做等待检测（挂起的提问/审批必在最新事件）；running=false 才分页做结算判定。
+  async pollExecution(sessionId, startedAt, sessions) {
+    let items = sessions
+    if (items === undefined) {
+      const response = await this.api.sessions.list(rpcRequest({}))
+      if (!response.result.ok) return { awaiting: undefined, outcome: 'pending' }
+      items = response.result.value.items
+    }
+    const summary = items.find((item) => item.sessionId === sessionId)
+    if (summary === undefined) {
+      return { awaiting: undefined, outcome: 'failed', error: 'execution session no longer exists', failKind: 'abnormal' }
+    }
+    if (summary.running) {
+      const history = await this.api.sessions.history(rpcRequest({ sessionId, maxMessages: 100 }))
+      if (!history.result.ok) return { awaiting: undefined, outcome: 'pending' }
+      return { awaiting: this.awaitingFromEvents(history.result.value.events || []), outcome: 'pending' }
+    }
+
+    const events = []
+    let beforeSeq
+    let reachedBoundary = false
+    for (let page = 0; page < 100; page += 1) {
+      const history = await this.api.sessions.history(rpcRequest({
+        sessionId,
+        maxMessages: 100,
+        ...(beforeSeq === undefined ? {} : { beforeSeq }),
+      }))
+      if (!history.result.ok) return { awaiting: this.awaitingFromEvents(events), outcome: 'pending' }
+      const pageEvents = history.result.value.events || []
+      events.push(...pageEvents)
+      const oldestTime = pageEvents.reduce((acc, entry) => {
+        const time = entry && entry.event && entry.event.time
+        return typeof time === 'number' ? (acc === undefined ? time : Math.min(acc, time)) : acc
+      }, undefined)
+      if (!history.result.value.hasMore || (oldestTime !== undefined && oldestTime <= startedAt)) {
+        reachedBoundary = true
+        break
+      }
+      const oldestSeq = pageEvents.reduce((acc, entry) => {
+        const seq = entry && entry.event && entry.event.seq
+        return typeof seq === 'number' ? (acc === undefined ? seq : Math.min(acc, seq)) : acc
+      }, undefined)
+      if (oldestSeq === undefined || oldestSeq === beforeSeq) return { awaiting: this.awaitingFromEvents(events), outcome: 'pending' }
+      beforeSeq = oldestSeq
+    }
+    if (!reachedBoundary) return { awaiting: this.awaitingFromEvents(events), outcome: 'pending' }
+    const awaiting = this.awaitingFromEvents(events)
+    const turnEnd = events
+      .filter((entry) => entry && entry.event && entry.event.type === 'turn/end' && (
+        startedAt <= 0 || (typeof entry.event.time === 'number' && entry.event.time >= startedAt)
+      ))
+      .sort((a, b) => (a.event.seq ?? Number.MAX_SAFE_INTEGER) - (b.event.seq ?? Number.MAX_SAFE_INTEGER))[0]
+    if (turnEnd === undefined) return { awaiting, outcome: 'pending' }
+    const data = turnEnd.event.data
+    const reason = data && typeof data === 'object' ? data.reason : undefined
+    const kind = reason && typeof reason === 'object' && typeof reason.kind === 'string' ? reason.kind : undefined
+    if (kind === 'completed') return { awaiting: undefined, outcome: 'succeeded' }
+    const failKind = kind === 'aborted' || kind === 'interrupted' ? 'abnormal' : 'unknown'
+    return { awaiting: undefined, outcome: 'failed', error: turnEndFailure(kind, reason), failKind }
+  }
+}
+
+// ---------- 新建任务配置记忆 ----------
+class LastConfig {
+  constructor(dir) {
+    this.file = join(dir, 'last-config.json')
+    this.value = this.load()
+  }
+
+  load() {
+    try {
+      const parsed = JSON.parse(readFileSync(this.file, 'utf8'))
+      return this.normalize(parsed)
+    } catch {
+      return { ...DEFAULT_LAST_CONFIG }
+    }
+  }
+
+  normalize(input) {
+    const out = { ...DEFAULT_LAST_CONFIG }
+    if (!input || typeof input !== 'object') return out
+    if (typeof input.mode === 'string' && input.mode !== '') out.mode = input.mode
+    if (MODEL_KINDS.indexOf(input.model) !== -1) out.model = input.model
+    if (REASONING_LEVELS.indexOf(input.reasoning) !== -1) out.reasoning = input.reasoning
+    if (isTaskPermission(input.permission)) out.permission = input.permission
+    if (typeof input.scheduleEnabled === 'boolean') out.scheduleEnabled = input.scheduleEnabled
+    if (SCHEDULE_MODES.indexOf(input.scheduleMode) !== -1) out.scheduleMode = input.scheduleMode
+    if (parseTime(input.scheduleTime)) out.scheduleTime = input.scheduleTime
+    if (Number.isInteger(input.scheduleCount) && input.scheduleCount >= 1) out.scheduleCount = input.scheduleCount
+    if (DAILY_REPEATS.indexOf(input.scheduleRepeat) !== -1) out.scheduleRepeat = input.scheduleRepeat
+    if (Number.isInteger(input.scheduleInterval) && input.scheduleInterval >= 1) out.scheduleInterval = input.scheduleInterval
+    if (INTERVAL_UNITS.indexOf(input.scheduleIntervalUnit) !== -1) out.scheduleIntervalUnit = input.scheduleIntervalUnit
+    return out
+  }
+
+  get() {
+    return { ...this.value }
+  }
+
+  remember(input) {
+    const value = this.normalize({
+      mode: typeof input.mode === 'string' && input.mode !== '' ? input.mode : undefined,
+      model: input.model,
+      reasoning: input.reasoning,
+      permission: input.permission,
+      scheduleEnabled: !!(input.schedule && input.schedule.enabled === true),
+      scheduleMode: input.schedule && input.schedule.mode,
+      scheduleTime: input.schedule && input.schedule.time,
+      scheduleCount: input.schedule && input.schedule.totalRuns,
+      scheduleRepeat: input.schedule && input.schedule.repeat,
+      scheduleInterval: input.schedule && input.schedule.interval,
+      scheduleIntervalUnit: input.schedule && input.schedule.intervalUnit,
+    })
+    this.value = value
+    writeJsonAtomic(this.file, value)
+    return { ...value }
+  }
+}
+
+// ---------- 阻止系统休眠（系统不睡、屏幕可熄） ----------
+const POWER_RETRY_DELAYS = [1_000, 2_000, 5_000, 10_000, 30_000]
+const LINUX_INHIBIT_PATHS = ['/usr/bin/systemd-inhibit', '/bin/systemd-inhibit']
+
+const WINDOWS_HELPER = String.raw`
+$source = @'
+using System;
+using System.Runtime.InteropServices;
+public static class DshExecutionState {
+  [DllImport("kernel32.dll", SetLastError = true)]
+  public static extern uint SetThreadExecutionState(uint flags);
+}
+'@
+Add-Type -TypeDefinition $source
+$continuous = [Convert]::ToUInt32('80000000', 16)
+$systemRequired = [uint32]0x00000001
+try {
+  $result = [DshExecutionState]::SetThreadExecutionState($continuous -bor $systemRequired)
+  if ($result -eq 0) { throw 'SetThreadExecutionState failed' }
+  [Console]::Out.WriteLine('READY')
+  [Console]::Out.Flush()
+  while ([Console]::In.ReadLine() -ne $null) { }
+} finally {
+  [void][DshExecutionState]::SetThreadExecutionState($continuous)
+}
+`
+
+const LINUX_HELPER = String.raw`
+process.stdout.write('READY\n')
+process.stdin.resume()
+`
+
+class PowerInhibitor {
+  constructor() {
+    this.listeners = new Set()
+    this.enabled = false
+    this.reasons = { runningSessions: 0, armedSchedules: 0, sessionStateKnown: false }
+    this.phase = 'disabled'
+    this.child = undefined
+    this.retry = undefined
+    this.retryIndex = 0
+    this.lastError = undefined
+    this.stopping = false
+    this.platform = process.platform
+    this.pid = process.pid
+    this.env = process.env
+    this.linuxProbe = undefined
+  }
+
+  setEnabled(enabled) { this.enabled = enabled; this.sync(); this.emit() }
+  updateReasons(reasons) { this.reasons = reasons; this.sync(); this.emit() }
+  subscribe(listener) { this.listeners.add(listener); return () => { this.listeners.delete(listener) } }
+
+  snapshot() {
+    return {
+      platform: this.platform,
+      phase: this.phase,
+      enabled: this.enabled,
+      runningSessions: this.reasons.runningSessions,
+      armedSchedules: this.reasons.armedSchedules,
+      sessionStateKnown: this.reasons.sessionStateKnown,
+      ...(this.lastError === undefined ? {} : { lastError: this.lastError }),
+    }
+  }
+
+  dispose() {
+    this.enabled = false
+    this.release()
+    this.phase = 'disabled'
+    this.emit()
+    this.listeners.clear()
+  }
+
+  desired() {
+    return this.enabled && (!this.reasons.sessionStateKnown || this.reasons.runningSessions > 0 || this.reasons.armedSchedules > 0)
+  }
+
+  sync() {
+    if (!this.enabled) { this.release(); this.phase = 'disabled'; return }
+    if (this.platform !== 'darwin' && this.platform !== 'win32' && this.platform !== 'linux') { this.release(); this.phase = 'unsupported'; return }
+    if (this.platform === 'linux' && this.linuxSystemdInhibit() === undefined) { this.release(); this.phase = 'unsupported'; return }
+    if (!this.desired()) { this.release(); this.phase = 'idle'; return }
+    if (this.child === undefined && this.retry === undefined) this.acquire()
+  }
+
+  acquire() {
+    this.phase = 'acquiring'
+    this.emit()
+    this.stopping = false
+    try {
+      const child = this.spawnCommand()
+      this.child = child
+      let ready = false
+      let stderr = ''
+      if (this.platform === 'darwin') {
+        child.once('spawn', () => { ready = true; this.markReady(child) })
+      }
+      child.stdout?.on('data', (chunk) => {
+        if (!ready && chunk.toString('utf8').includes('READY')) { ready = true; this.markReady(child) }
+      })
+      child.stderr?.on('data', (chunk) => { stderr = `${stderr}${chunk.toString('utf8')}`.slice(-2000) })
+      child.on('error', (error) => { this.fail(error, child) })
+      child.on('exit', (code, signal) => {
+        if (this.child !== child) return
+        this.child = undefined
+        if (this.stopping || !this.desired()) return
+        const detail = stderr.trim()
+        this.fail(new Error(`power helper exited (${String(code ?? signal ?? 'unknown')})${detail === '' ? '' : `: ${detail}`}`))
+      })
+    } catch (error) {
+      this.fail(error)
+    }
+  }
+
+  markReady(child) {
+    if (this.child !== child || !this.desired()) return
+    this.phase = 'active'
+    this.retryIndex = 0
+    this.lastError = undefined
+    this.emit()
+  }
+
+  fail(error, source) {
+    if (source !== undefined && this.child !== source) return
+    this.lastError = error instanceof Error ? error.message : String(error)
+    this.phase = 'error'
+    this.emit()
+    const child = this.child
+    this.child = undefined
+    child?.stdin?.end()
+    child?.kill()
+    if (!this.desired() || this.retry !== undefined) return
+    const delay = POWER_RETRY_DELAYS[Math.min(this.retryIndex, POWER_RETRY_DELAYS.length - 1)]
+    this.retryIndex += 1
+    this.retry = setTimeout(() => { this.retry = undefined; if (this.desired()) this.acquire() }, delay)
+  }
+
+  release() {
+    if (this.retry !== undefined) { clearTimeout(this.retry); this.retry = undefined }
+    this.lastError = undefined
+    const child = this.child
+    this.child = undefined
+    if (child === undefined) return
+    this.stopping = true
+    if (this.platform === 'win32' || this.platform === 'linux') {
+      child.stdin?.end()
+      const force = setTimeout(() => { if (child.exitCode === null) child.kill() }, 1000)
+      child.once('exit', () => { clearTimeout(force) })
+    } else {
+      child.kill('SIGTERM')
+    }
+  }
+
+  windowsPowerShell() {
+    const root = this.env.SystemRoot
+    if (root === undefined || root.trim() === '') throw new Error('SystemRoot is unavailable')
+    if (!win32.isAbsolute(root)) throw new Error('SystemRoot is not an absolute path')
+    return win32.join(root, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+  }
+
+  linuxSystemdInhibit() {
+    if (this.linuxProbe !== undefined) return this.linuxProbe.available ? this.linuxProbe.executable : undefined
+    const executable = LINUX_INHIBIT_PATHS.find((p) => existsSync(p))
+    if (executable === undefined) { this.linuxProbe = { available: false }; return undefined }
+    try {
+      const probe = spawnSync(executable, ['--list', '--no-pager'], { stdio: 'ignore', timeout: 2000, windowsHide: true })
+      this.linuxProbe = { executable, available: probe.status === 0 && probe.error === undefined }
+    } catch (e) {
+      this.linuxProbe = { available: false }
+    }
+    return this.linuxProbe.available ? executable : undefined
+  }
+
+  spawnCommand() {
+    if (this.platform === 'darwin') {
+      return spawn('/usr/bin/caffeinate', ['-i', '-w', String(this.pid)], { shell: false, windowsHide: false, stdio: ['ignore', 'ignore', 'ignore'] })
+    }
+    if (this.platform === 'linux') {
+      const executable = this.linuxSystemdInhibit()
+      if (executable === undefined) throw new Error('systemd-inhibit is unavailable')
+      return spawn(executable, [
+        '--what=idle',
+        '--who=DeepSeek Harness task board',
+        '--why=DSH sessions are running or schedules are armed',
+        '--mode=block',
+        '--',
+        process.execPath,
+        '-e',
+        LINUX_HELPER,
+      ], { shell: false, windowsHide: false, stdio: ['pipe', 'pipe', 'pipe'] })
+    }
+    return spawn(this.windowsPowerShell(), ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', WINDOWS_HELPER], { shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] })
+  }
+
+  emit() {
+    for (const fn of [...this.listeners]) fn()
+  }
+}
+
+// 阻止休眠开关持久化（power.json，默认开启）
+class PowerSetting {
+  constructor(dir) {
+    this.file = join(dir, 'power.json')
+    this.value = this.load()
+  }
+
+  load() {
+    try {
+      const v = JSON.parse(readFileSync(this.file, 'utf8'))
+      return typeof v.preventIdleSleep === 'boolean' ? v.preventIdleSleep : true
+    } catch {
+      return true
+    }
+  }
+
+  get() { return this.value }
+  set(v) { this.value = v === true; writeJsonAtomic(this.file, { preventIdleSleep: this.value }); return this.value }
+}
+
+// ---------- 服务 ----------
+class TaskBoardService {
+  constructor(api, agents, commands, workspaceRegistry) {
+    const dir = dataDir()
+    this.api = api
+    this.ledger = new Ledger(dir)
+    this.lastConfig = new LastConfig(dir)
+    this.runner = new Runner(api, agents, commands)
+    this.powerSetting = new PowerSetting(dir)
+    this.power = new PowerInhibitor()
+    this.workspaceRegistry = workspaceRegistry
+    this.lastArchivedIds = null // 首次轮询建立基线；之后对比做归档双向联动（不持久化）
+    this.archivedSyncInFlight = false
+    this.listeners = new Set()
+    this.timers = []
+    this.lastTickAt = undefined
+    this.lastScheduleTick = undefined
+    this.pollInFlight = false
+    this.tickInFlight = false
+    this.disposed = false
+    this.lastPowerJson = JSON.stringify(this.power.snapshot())
+    this.needsHuman = new Map() // taskId → { reason: 'approval'|'question', since }（运行时状态，不持久化）
+    this.ledger.subscribe(() => { this.syncPowerReasons(); this.emit() })
+    this.power.subscribe(() => {
+      const json = JSON.stringify(this.power.snapshot())
+      if (json === this.lastPowerJson) return
+      this.lastPowerJson = json
+      this.emit()
+    })
+    this.power.setEnabled(this.powerSetting.get())
+    this.syncPowerReasons()
+  }
+
+  start() {
+    if (this.disposed || this.timers.length > 0) return
+    this.timers.push(setInterval(() => { this.schedulePoll() }, SESSION_POLL_MS))
+    this.timers.push(setInterval(() => { this.scheduleArchivedSync() }, SESSION_POLL_MS))
+    this.timers.push(setInterval(() => { this.scheduleTick(false) }, SCHEDULE_TICK_MS))
+    this.schedulePoll()
+    this.scheduleArchivedSync()
+    this.scheduleTick(true)
+  }
+
+  schedulerSnapshot() {
+    const scheduler = this.ledger.summary().scheduler
+    return { timeZone: scheduler.timeZone, ledgerId: scheduler.ledgerId, ...(this.lastTickAt === undefined ? {} : { lastTickAt: this.lastTickAt }), ...(scheduler.error === undefined ? {} : { error: scheduler.error }) }
+  }
+
+  snapshot() {
+    const state = this.ledger.state()
+    return {
+      schemaVersion: SCHEMA_VERSION,
+      revision: state.revision,
+      tasks: state.tasks,
+      scheduler: this.schedulerSnapshot(),
+      power: this.power.snapshot(),
+      lastConfig: this.lastConfig.get(),
+      needsHuman: [...this.needsHuman]
+        .filter(([taskId]) => state.tasks.some((t) => t.id === taskId && t.archivedAt === undefined))
+        .map(([taskId, v]) => ({ taskId, reason: v.reason })),
+    }
+  }
+
+  subscribe(listener) {
+    this.listeners.add(listener)
+    return () => { this.listeners.delete(listener) }
+  }
+
+  emit() {
+    for (const fn of [...this.listeners]) fn()
+  }
+
+  syncPowerReasons() {
+    const current = this.power.snapshot()
+    this.power.updateReasons({
+      runningSessions: current.runningSessions,
+      armedSchedules: this.ledger.armedScheduleCount(),
+      sessionStateKnown: current.sessionStateKnown,
+    })
+  }
+
+  apply(requestId, action) {
+    if (action.kind === 'set-settings') {
+      if (action.patch.preventIdleSleep !== undefined) {
+        this.powerSetting.set(action.patch.preventIdleSleep)
+        this.power.setEnabled(action.patch.preventIdleSleep)
+      }
+      return this.snapshot()
+    }
+    const result = this.ledger.applyRequest(requestId, action)
+    if (action.kind === 'create') this.lastConfig.remember(action.input)
+    if (action.kind === 'archive') void this.archiveLinkedSessions(action.taskId)
+    if (action.kind === 'restore') void this.restoreLinkedSessions(action.taskId)
+    if (result.run !== undefined) this.scheduleLaunch(result.run)
+    if (result.cancelSessionId !== undefined) void this.runner.cancelSession(result.cancelSessionId)
+    return {
+      schemaVersion: SCHEMA_VERSION,
+      revision: result.state.revision,
+      tasks: result.state.tasks,
+      scheduler: this.schedulerSnapshot(),
+      power: this.power.snapshot(),
+      lastConfig: this.lastConfig.get(),
+    }
+  }
+
+  async options() {
+    let workspaces = []
+    let presets = []
+    try {
+      const w = await this.api.workspace.list(rpcRequest({}))
+      if (w.result.ok) workspaces = w.result.value.items.map((item) => ({ workspaceId: item.workspaceId, title: item.title !== '' ? item.title : item.path }))
+    } catch { /* 缺省为空 */ }
+    try {
+      const p = await this.api.agentPresets.list(rpcRequest({}))
+      if (p.result.ok) presets = p.result.value.presets.map((item) => ({ id: item.id, name: item.name, description: item.description, broken: item.broken, isDefault: item.isDefault }))
+    } catch { /* 缺省为空 */ }
+    return { workspaces, presets }
+  }
+
+  scheduleLaunch(opened) {
+    void this.launch(opened).catch((err) => {
+      console.error('[dsh-task-board] execution launch settlement failed', err)
+    })
+  }
+
+  async launch(opened) {
+    try {
+      const sessionId = await this.runner.launch(opened.task)
+      this.ledger.attachSession(opened.task.id, opened.execution.id, sessionId)
+    } catch (err) {
+      if (err instanceof SessionLaunchError) this.ledger.attachSession(opened.task.id, opened.execution.id, err.sessionId)
+      this.ledger.settle(opened.task.id, opened.execution.id, 'failed', err instanceof Error ? err.message : String(err), 'unknown')
+    }
+  }
+
+  schedulePoll() {
+    if (this.pollInFlight || this.disposed) return
+    this.pollInFlight = true
+    void this.pollSessions().catch((err) => {
+      console.error('[dsh-task-board] session polling failed', err)
+    }).finally(() => { this.pollInFlight = false })
+  }
+
+  async pollSessions() {
+    if (this.disposed) return
+    const running = await this.runner.listRunning()
+    if (!running.known) {
+      this.power.updateReasons({ runningSessions: this.power.snapshot().runningSessions, armedSchedules: this.ledger.armedScheduleCount(), sessionStateKnown: false })
+      return
+    }
+    this.power.updateReasons({ runningSessions: running.items.filter((s) => s.running).length, armedSchedules: this.ledger.armedScheduleCount(), sessionStateKnown: true })
+    const open = this.ledger.openExecutions()
+    for (const execution of open) {
+      if (execution.sessionId === undefined) continue
+      // 统一轮询：一次拉取完成「等待人工」检测 + 「结算」检测（挂起超时在此处理）
+      let result
+      try {
+        result = await this.runner.pollExecution(execution.sessionId, execution.startedAt, running.items)
+      } catch {
+        // 瞬时检查失败：不结算、不改变挂起标记，下一轮重试
+        continue
+      }
+      if (result.awaiting !== undefined) {
+        const prev = this.needsHuman.get(execution.taskId)
+        const since = prev !== undefined ? prev.since : Date.now()
+        if (Date.now() - since >= HANG_TIMEOUT_MS) {
+          // 挂起超过 12h：强制结算（recurring 任务按规则回待执行，其余进已失败）
+          this.needsHuman.delete(execution.taskId)
+          this.ledger.settle(execution.taskId, execution.executionId, 'failed', '挂起时间过长', 'timeout')
+          continue
+        }
+        this.needsHuman.set(execution.taskId, { reason: result.awaiting.reason, since })
+      } else {
+        this.needsHuman.delete(execution.taskId)
+      }
+      if (result.outcome === 'pending') continue
+      this.ledger.settle(execution.taskId, execution.executionId, result.outcome, result.error, result.failKind)
+    }
+    // 清理已结算/取消/删除任务的挂起标记
+    const openIds = new Set(open.map((e) => e.taskId))
+    for (const taskId of [...this.needsHuman.keys()]) {
+      if (!openIds.has(taskId)) this.needsHuman.delete(taskId)
+    }
+  }
+
+  scheduleTick(first) {
+    if (this.tickInFlight || this.disposed) return
+    this.tickInFlight = true
+    void this.tickSchedule(first).catch((err) => {
+      console.error('[dsh-task-board] scheduler tick failed', err)
+    }).finally(() => { this.tickInFlight = false })
+  }
+
+  async tickSchedule(first) {
+    if (this.disposed) return
+    const now = Date.now()
+    this.lastTickAt = now
+    const recovered = first || (this.lastScheduleTick !== undefined && now - this.lastScheduleTick > RESUME_GAP_MS)
+    this.lastScheduleTick = now
+    if (recovered) {
+      this.ledger.skipMissed(now)
+      return
+    }
+    for (const taskId of this.ledger.dueScheduleTaskIds(now)) {
+      const opened = this.ledger.openScheduled(taskId, now)
+      if (opened !== undefined) this.scheduleLaunch(opened)
+    }
+  }
+
+  // ---------- 归档双向联动（任务 ↔ 主页面会话归档） ----------
+  // 方向 B：归档任务 → 归档其全部执行会话；反向 B：恢复任务 → 恢复其全部执行会话
+  async archiveLinkedSessions(taskId) {
+    if (!this.workspaceRegistry) return
+    const state = this.ledger.state()
+    const task = state.tasks.find((t) => t.id === taskId)
+    if (!task) return
+    for (const ex of task.executions) {
+      if (typeof ex.sessionId !== 'string' || ex.sessionId === '') continue
+      try { await this.workspaceRegistry.archiveSession(ex.sessionId) } catch (err) { console.error('[dsh-task-board] archive session failed', err) }
+    }
+  }
+
+  async restoreLinkedSessions(taskId) {
+    if (!this.workspaceRegistry) return
+    const state = this.ledger.state()
+    const task = state.tasks.find((t) => t.id === taskId)
+    if (!task) return
+    for (const ex of task.executions) {
+      if (typeof ex.sessionId !== 'string' || ex.sessionId === '') continue
+      try { await this.workspaceRegistry.unarchiveSession(ex.sessionId) } catch (err) { console.error('[dsh-task-board] unarchive session failed', err) }
+    }
+  }
+
+  // 会话 id → 关联任务（executions.sessionId 匹配）
+  findTaskBySession(sessionId) {
+    const state = this.ledger.state()
+    return state.tasks.find((t) => t.executions.some((e) => e.sessionId === sessionId))
+  }
+
+  scheduleArchivedSync() {
+    if (this.archivedSyncInFlight || this.disposed) return
+    this.archivedSyncInFlight = true
+    void this.syncArchivedSessions().catch((err) => {
+      console.error('[dsh-task-board] archived sessions sync failed', err)
+    }).finally(() => { this.archivedSyncInFlight = false })
+  }
+
+  // 方向 A + 反向 A：轮询对比主页面归档集合 → 联动归档/恢复看板任务
+  async syncArchivedSessions() {
+    if (!this.workspaceRegistry) return
+    let current
+    try {
+      current = new Set(this.workspaceRegistry.archivedSessionIds)
+    } catch {
+      return // 服务未就绪/异常，下一轮重试
+    }
+    if (this.lastArchivedIds === null) {
+      this.lastArchivedIds = current // 首次只建基线，不联动历史归档
+      return
+    }
+    const previous = this.lastArchivedIds
+    this.lastArchivedIds = current
+    for (const id of current) {
+      if (previous.has(id)) continue
+      const task = this.findTaskBySession(id)
+      if (task === undefined || task.archivedAt !== undefined || task.status === 'running' || hasOpenExecution(task)) continue
+      try {
+        this.ledger.applyRequest(uuid(), { kind: 'archive', taskId: task.id })
+      } catch (err) { console.error('[dsh-task-board] linked archive failed', err) }
+    }
+    for (const id of previous) {
+      if (current.has(id)) continue
+      const task = this.findTaskBySession(id)
+      if (task === undefined || task.archivedAt === undefined) continue
+      try {
+        this.ledger.applyRequest(uuid(), { kind: 'restore', taskId: task.id })
+      } catch (err) { console.error('[dsh-task-board] linked restore failed', err) }
+    }
+  }
+
+  dispose() {
+    this.disposed = true
+    for (const timer of this.timers.splice(0)) clearInterval(timer)
+    this.power.dispose()
+    this.ledger.dispose()
+    this.listeners.clear()
+  }
+}
+
+// ---------- 协议校验 ----------
+function normalizeScheduleInput(input) {
+  if (!input || typeof input !== 'object') throw new Error('invalid schedule')
+  const mode = input.mode
+  if (SCHEDULE_MODES.indexOf(mode) === -1) throw new Error('invalid schedule mode')
+  let time
+  if (mode === 'once' || mode === 'daily') {
+    time = String(input.time || '').trim()
+    if (!parseTime(time)) throw new Error('invalid schedule time')
+  }
+  const out = { enabled: input.enabled === true, mode, time }
+  if (mode === 'daily') {
+    const repeat = input.repeat === 'count' ? 'count' : 'infinite'
+    out.repeat = repeat
+    if (repeat === 'count') {
+      const totalRuns = Number(input.totalRuns)
+      if (!Number.isInteger(totalRuns) || totalRuns < 1) throw new Error('invalid run count')
+      out.totalRuns = totalRuns
+    }
+  }
+  if (mode === 'interval') {
+    const interval = Number(input.interval)
+    const unit = input.intervalUnit
+    if (!isValidInterval(interval, unit)) throw new Error('invalid interval (max 1 year)')
+    out.interval = interval
+    out.intervalUnit = unit
+  }
+  return out
+}
+
+function optionalString(value) {
+  return value === undefined || typeof value === 'string'
+}
+
+function parseCreateInput(input) {
+  if (!input || typeof input !== 'object') return undefined
+  if (typeof input.title !== 'string' || typeof input.description !== 'string' || typeof input.prompt !== 'string') return undefined
+  if (!optionalString(input.workspaceId) || !optionalString(input.mode)) return undefined
+  if (input.permission !== undefined && !isTaskPermission(input.permission)) return undefined
+  if (input.model !== undefined && MODEL_KINDS.indexOf(input.model) === -1) return undefined
+  if (input.reasoning !== undefined && REASONING_LEVELS.indexOf(input.reasoning) === -1) return undefined
+  if (input.status !== undefined && input.status !== 'backlog' && input.status !== 'todo') return undefined
+  let schedule
+  if (input.schedule !== undefined) {
+    const s = input.schedule
+    if (!s || typeof s !== 'object') return undefined
+    if (typeof s.enabled !== 'boolean' || SCHEDULE_MODES.indexOf(s.mode) === -1) return undefined
+    schedule = { enabled: s.enabled, mode: s.mode }
+    if (s.mode === 'once' || s.mode === 'daily') {
+      if (typeof s.time !== 'string' || !parseTime(s.time)) return undefined
+      schedule.time = s.time
+    }
+    if (s.mode === 'daily') {
+      schedule.repeat = s.repeat === 'count' ? 'count' : 'infinite'
+      if (schedule.repeat === 'count') {
+        const totalRuns = Number(s.totalRuns)
+        if (!Number.isInteger(totalRuns) || totalRuns < 1) return undefined
+        schedule.totalRuns = totalRuns
+      }
+    }
+    if (s.mode === 'interval') {
+      const interval = Number(s.interval)
+      if (!isValidInterval(interval, s.intervalUnit)) return undefined
+      schedule.interval = interval
+      schedule.intervalUnit = s.intervalUnit
+    }
+  }
+  return {
+    title: input.title,
+    description: input.description,
+    prompt: input.prompt,
+    ...(input.workspaceId === undefined ? {} : { workspaceId: input.workspaceId }),
+    ...(input.mode === undefined ? {} : { mode: input.mode }),
+    ...(input.permission === undefined ? {} : { permission: input.permission }),
+    ...(input.model === undefined ? {} : { model: input.model }),
+    ...(input.reasoning === undefined ? {} : { reasoning: input.reasoning }),
+    ...(input.status === undefined ? {} : { status: input.status }),
+    ...(schedule === undefined ? {} : { schedule }),
+  }
+}
+
+function parseUpdatePatch(patch) {
+  if (!patch || typeof patch !== 'object') return undefined
+  const out = {}
+  for (const field of TASK_CONTENT_FIELDS) {
+    if (field in patch) {
+      if (!optionalString(patch[field])) return undefined
+      out[field] = patch[field]
+    }
+  }
+  for (const field of ['workspaceId', 'mode']) {
+    if (field in patch) {
+      if (!optionalString(patch[field])) return undefined
+      out[field] = patch[field]
+    }
+  }
+  if ('permission' in patch) {
+    if (patch.permission !== undefined && !isTaskPermission(patch.permission)) return undefined
+    out.permission = patch.permission
+  }
+  if ('model' in patch) {
+    if (MODEL_KINDS.indexOf(patch.model) === -1) return undefined
+    out.model = patch.model
+  }
+  if ('reasoning' in patch) {
+    if (REASONING_LEVELS.indexOf(patch.reasoning) === -1) return undefined
+    out.reasoning = patch.reasoning
+  }
+  return out
+}
+
+function parseSchedulePatch(patch) {
+  if (!patch || typeof patch !== 'object') return undefined
+  const out = {}
+  if ('enabled' in patch) {
+    if (typeof patch.enabled !== 'boolean') return undefined
+    out.enabled = patch.enabled
+  }
+  if ('mode' in patch) {
+    if (SCHEDULE_MODES.indexOf(patch.mode) === -1) return undefined
+    out.mode = patch.mode
+  }
+  if ('time' in patch) {
+    if (typeof patch.time !== 'string' || !parseTime(patch.time)) return undefined
+    out.time = patch.time
+  }
+  if ('repeat' in patch) {
+    if (DAILY_REPEATS.indexOf(patch.repeat) === -1) return undefined
+    out.repeat = patch.repeat
+  }
+  if ('totalRuns' in patch) {
+    const n = Number(patch.totalRuns)
+    if (!Number.isInteger(n) || n < 1) return undefined
+    out.totalRuns = n
+  }
+  if ('interval' in patch) {
+    const n = Number(patch.interval)
+    if (!Number.isInteger(n) || n < 1) return undefined
+    out.interval = n
+  }
+  if ('intervalUnit' in patch) {
+    if (INTERVAL_UNITS.indexOf(patch.intervalUnit) === -1) return undefined
+    out.intervalUnit = patch.intervalUnit
+  }
+  return out
+}
+
+function parseSettingsPatch(patch) {
+  if (!patch || typeof patch !== 'object') return undefined
+  const out = {}
+  if ('preventIdleSleep' in patch) {
+    if (typeof patch.preventIdleSleep !== 'boolean') return undefined
+    out.preventIdleSleep = patch.preventIdleSleep
+  }
+  if (Object.keys(out).length === 0) return undefined
+  return out
+}
+
+function parseActionEnvelope(value) {
+  if (!value || typeof value !== 'object') return undefined
+  if (typeof value.requestId !== 'string' || value.requestId.trim() === '' || value.requestId.length > 256) return undefined
+  const action = value.action
+  if (!action || typeof action !== 'object' || typeof action.kind !== 'string') return undefined
+  const taskId = typeof action.taskId === 'string' && action.taskId !== '' ? action.taskId : undefined
+  switch (action.kind) {
+    case 'create': {
+      if (typeof action.id !== 'string' || action.id === '') return undefined
+      const input = parseCreateInput(action.input)
+      if (input === undefined) return undefined
+      return { requestId: value.requestId, action: { kind: 'create', id: action.id, input } }
+    }
+    case 'update': {
+      if (taskId === undefined) return undefined
+      const patch = parseUpdatePatch(action.patch)
+      if (patch === undefined) return undefined
+      return { requestId: value.requestId, action: { kind: 'update', taskId, patch } }
+    }
+    case 'set-schedule': {
+      if (taskId === undefined) return undefined
+      const patch = parseSchedulePatch(action.patch)
+      if (patch === undefined) return undefined
+      return { requestId: value.requestId, action: { kind: 'set-schedule', taskId, patch } }
+    }
+    case 'move': {
+      if (taskId === undefined || !isTaskStatus(action.status)) return undefined
+      return { requestId: value.requestId, action: { kind: 'move', taskId, status: action.status } }
+    }
+    case 'set-settings': {
+      const patch = parseSettingsPatch(action.patch)
+      if (patch === undefined) return undefined
+      return { requestId: value.requestId, action: { kind: 'set-settings', patch } }
+    }
+    case 'delete':
+    case 'restore':
+    case 'run':
+    case 'rerun':
+    case 'cancel': {
+      if (taskId === undefined) return undefined
+      return { requestId: value.requestId, action: { kind: action.kind, taskId } }
+    }
+    case 'archive': {
+      if (taskId === undefined) return undefined
+      let seq
+      if (action.seq !== undefined) {
+        const n = Number(action.seq)
+        if (!Number.isInteger(n) || n < 1) return undefined
+        seq = n
+      }
+      return { requestId: value.requestId, action: { kind: 'archive', taskId, ...(seq === undefined ? {} : { seq }) } }
+    }
+    default:
+      return undefined
+  }
+}
+
+// ---------- HTTP 工具 ----------
+function sameOrigin(req) {
+  const fetchSite = req.headers['sec-fetch-site']
+  if (fetchSite === 'cross-site') return false
+  const origin = req.headers.origin
+  if (origin === undefined) return fetchSite === 'same-origin' || fetchSite === 'same-site' || fetchSite === 'none'
+  const host = req.headers.host
+  if (host === undefined) return false
+  try {
+    const parsed = new URL(origin)
+    return (parsed.protocol === 'http:' || parsed.protocol === 'https:') && parsed.host === host
+  } catch {
+    return false
+  }
+}
+
+function readBody(req, maxBytes) {
+  return new Promise(function (resolve, reject) {
+    const chunks = []
+    let size = 0
+    req.on('data', function (chunk) {
+      size += chunk.length
+      if (size > maxBytes) {
+        const err = new Error('body too large')
+        err.status = 413
+        reject(err)
+        req.destroy()
+        return
+      }
+      chunks.push(chunk)
+    })
+    req.on('end', function () { resolve(Buffer.concat(chunks).toString('utf8')) })
+    req.on('error', reject)
+  })
+}
+
+function respond(res, status, payload) {
+  const body = JSON.stringify(payload)
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': Buffer.byteLength(body),
+    'Cache-Control': 'no-store',
+  })
+  res.end(body)
+}
+
+function makeHandler(service) {
+  return async function (req, res) {
+    try {
+      const url = new URL(req.url || '/', 'http://localhost')
+      const path = url.pathname
+
+      if (path === `${ROUTE_PREFIX}/state`) {
+        if (req.method !== 'GET') return respond(res, 405, { ok: false, error: 'method-not-allowed' })
+        if (!sameOrigin(req)) return respond(res, 403, { ok: false, error: 'forbidden' })
+        return respond(res, 200, service.snapshot())
+      }
+
+      if (path === `${ROUTE_PREFIX}/options`) {
+        if (req.method !== 'GET') return respond(res, 405, { ok: false, error: 'method-not-allowed' })
+        if (!sameOrigin(req)) return respond(res, 403, { ok: false, error: 'forbidden' })
+        return respond(res, 200, await service.options())
+      }
+
+      if (path === `${ROUTE_PREFIX}/action`) {
+        if (req.method !== 'POST') return respond(res, 405, { ok: false, error: 'method-not-allowed' })
+        if (!sameOrigin(req)) return respond(res, 403, { ok: false, error: 'forbidden' })
+        if (!(req.headers['content-type'] || '').toLowerCase().startsWith('application/json')) {
+          return respond(res, 415, { ok: false, error: 'json-required' })
+        }
+        const raw = await readBody(req, ACTION_LIMIT)
+        let value
+        try { value = JSON.parse(raw) } catch { return respond(res, 400, { ok: false, error: 'invalid JSON body' }) }
+        const parsed = parseActionEnvelope(value)
+        if (parsed === undefined) return respond(res, 400, { ok: false, error: 'invalid-action' })
+        return respond(res, 200, service.apply(parsed.requestId, parsed.action))
+      }
+
+      return respond(res, 404, { ok: false, error: 'not found' })
+    } catch (err) {
+      const status = (err && err.status) || 500
+      respond(res, status, { ok: false, error: status === 500 ? 'internal error' : String((err && err.message) || err) })
+    }
+  }
+}
+
+// ---------- 插件入口 ----------
+export default {
+  inject: [],
+  apply(ctx) {
+    ctx.inject(['webServer', 'apiProxy', 'agents', 'commands', 'workspaceRegistry'], function (hostCtx) {
+      hostCtx.effect(function () {
+        const service = new TaskBoardService(hostCtx.apiProxy, hostCtx.agents, hostCtx.commands, hostCtx.workspaceRegistry)
+        service.start()
+        const disposeRoute = hostCtx.webServer.register({
+          kind: 'prefix',
+          path: ROUTE_PREFIX,
+          handler: makeHandler(service),
+        })
+        return function () {
+          disposeRoute()
+          service.dispose()
+        }
+      }, 'dsh-task-board: host service and routes')
+    })
+  },
+}
