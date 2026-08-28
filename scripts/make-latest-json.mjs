@@ -31,7 +31,7 @@ if (!existsSync(installer) || !existsSync(sigFile)) {
 
 const signature = readFileSync(sigFile, 'utf8').trim();
 const tag = process.env.TAG || `v${version}`;
-const repo = process.env.REPO || 'ztmajor/DSH-DSCoder';
+const repo = process.env.REPO || 'ztmajor/DSCoder';
 const installerName = path.basename(installer);
 
 const manifest = {

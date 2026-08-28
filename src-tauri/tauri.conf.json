@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "dscoder",
-  "version": "0.1.1",
+  "version": "1.0.0",
   "identifier": "io.github.ztmajor.dscoder",
   "build": {
     "frontendDist": "../dist",
@@ -25,7 +25,7 @@
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ5OTcwMUM5MjFDMTM2NgpSV1JtRXh5U0hIQ1pCSktuYjZZSU9BZVBNV3Q4N2V2alVzUHFJZzlhK285OHlPTnpJTEtVdjdMSAo=",
       "endpoints": [
-        "https://github.com/ztmajor/DSH-DSCoder/releases/latest/download/latest.json"
+        "https://github.com/ztmajor/DSCoder/releases/latest/download/latest.json"
       ],
       "windows": {
         "installMode": "passive"
